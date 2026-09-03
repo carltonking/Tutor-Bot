@@ -33,6 +33,7 @@ export default function App() {
   const [sources, setSources] = useState<Src[]>([]);
   const [tab, setTab] = useState<"Sources"|"Plan"|"Mastery"|"Memory">("Sources");
   const active = SUBJECTS.find((s) => s.id === selected) || SUBJECTS[0];
+  const [chatLog, setChatLog] = useState<Array<{role:"user"|"bot", text:string}>>([]);
 
   useEffect(()=>{
     // fetch sources from python sidecar if running, else mock
@@ -112,21 +113,21 @@ export default function App() {
 
           <div className="separator"><span>Messages from <span className="pill purple">Main</span> and <span className="pill teal">{active.name}</span></span></div>
 
-          <div className="bubble bot">
-            <span className="pill purple">Main</span> sent over the midterm scope and <span className="pill teal">{active.name}</span> flagged the weak topics. Both are folded into tonight's plan.
-          </div>
-          <div className="bubble bot">
-            The 36 questions are sitting in the practice queue on my screen: topic, style, and a Draft badge on each. Nothing goes out until you've had a look.
-          </div>
-          <div className="bubble user">The top 10 look good. Send it. Run this every week. <span className="reaction">👍</span></div>
-          <div className="system-line">Created routine <span className="clock">🕒</span> Weekly review</div>
-          <div className="done-pill">Done.</div>
+          {chatLog.length===0 ? (
+            <>
+              <div className="bubble bot"><span className="pill purple">Main</span> sent over the midterm scope and <span className="pill teal">{active.name}</span> flagged the weak topics. Both are folded into tonight's plan.</div>
+              <div className="bubble bot">The 36 questions are sitting in the practice queue on my screen: topic, style, and a Draft badge on each. Nothing goes out until you've had a look.</div>
+              <div className="bubble user">The top 10 look good. Send it. Run this every week. <span className="reaction">👍</span></div>
+              <div className="system-line">Created routine <span className="clock">🕒</span> Weekly review</div>
+              <div className="done-pill">Done.</div>
+            </>
+          ) : chatLog.map((m,i)=> m.role==="user" ? <div key={i} className="bubble user">{m.text}</div> : <div key={i} className="bubble bot">{m.text}</div>)}
         </div>
 
         <div className="input-bar">
           <button className="plus-btn">+</button>
-          <input className="chat-input" placeholder={`Message ${active.name}`} value={input} onChange={(e) => setInput(e.target.value)} />
-          <button className="mic-btn">🎤</button>
+          <input className="chat-input" placeholder={`Message ${active.name}`} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={async (e)=>{ if(e.key==="Enter" && input.trim()){ const u=input; setInput(""); setChatLog(c=>[...c,{role:"user",text:u}]); try{ const r=await fetch(`http://localhost:1421/search/${selected}?q=${encodeURIComponent(u)}&k=2`); const j=await r.json(); const cite=j[0]?.text?.slice(0,120)||"no sources yet — upload PDFs"; setChatLog(c=>[...c,{role:"bot",text:`(${active.name} — citing: "${cite}...") Here's the grounded answer.`}]);}catch{ setChatLog(c=>[...c,{role:"bot",text:`Noted for ${active.name}. (sidecar offline — mock)`}]); } } }} />
+          <button className="mic-btn" onClick={async ()=>{ if(!input.trim()) return; const u=input; setInput(""); setChatLog(c=>[...c,{role:"user",text:u}]); try{ const r=await fetch(`http://localhost:1421/search/${selected}?q=${encodeURIComponent(u)}&k=2`); const j=await r.json(); const cite=j[0]?.text?.slice(0,120)||"no sources yet"; setChatLog(c=>[...c,{role:"bot",text:`(${active.name} — citing: "${cite}...") Here's the answer.`}]);}catch{ setChatLog(c=>[...c,{role:"bot",text:`Noted.`}]); } }}>➤</button>
         </div>
       </main>
 
