@@ -60,3 +60,4 @@ hr{ border:none; border-top:1px solid var(--border); margin:4px 0; }
 .upload-row{ display:flex; flex-wrap:wrap; gap:6px; }
 .u-btn{ background:var(--card); border:1px solid var(--border); color:var(--white); border-radius:8px; padding:6px 10px; font-size:12px; cursor:pointer; }
 .u-btn:hover{ background:var(--selected); }
+.memory-area{ width:100%; background:var(--card); color:var(--white); border:1px solid var(--border); border-radius:10px; padding:10px; font-family:ui-monospace, monospace; font-size:12px; resize:vertical; }

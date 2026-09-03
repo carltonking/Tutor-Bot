@@ -97,3 +97,57 @@ def grade(prompt: str = Form(...), answer: str = Form(...), rubric: str = Form(.
     score = 70 if len(answer.split()) > 5 else 40
     if any(w in answer.lower() for w in prompt.lower().split()[:3]): score += 10
     return {"score": min(score,100), "reasoning": f"Stub grader: checked against rubric '{rubric[:40]}...'", "rubric": rubric}
+
+# --- Memory: global.md + per-subject memory.md + sessions ---
+from datetime import datetime
+
+MEM_ROOT = ROOT / "memory"
+MEM_ROOT.mkdir(exist_ok=True)
+GLOBAL_MD = MEM_ROOT / "global.md"
+if not GLOBAL_MD.exists():
+    GLOBAL_MD.write_text("# Global Memory\n\n> Cross-subject preferences. Agent routes general instructions here.\n")
+
+@app.get("/memory/global")
+def get_global():
+    return {"text": GLOBAL_MD.read_text() if GLOBAL_MD.exists() else ""}
+
+@app.post("/memory/global")
+def post_global(text: str = Form(...)):
+    GLOBAL_MD.write_text(text)
+    return {"ok": True}
+
+@app.get("/memory/{subject_id}")
+def get_subject_memory(subject_id: str):
+    p = MEM_ROOT / subject_id / "memory.md"
+    if not p.exists():
+        return {"text": f"# {subject_id} Memory\n\n> Subject-specific preferences and session summaries.\n"}
+    return {"text": p.read_text()}
+
+@app.post("/memory/{subject_id}")
+def post_subject_memory(subject_id: str, text: str = Form(...)):
+    p = MEM_ROOT / subject_id / "memory.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    return {"ok": True}
+
+@app.post("/memory/{subject_id}/session")
+def post_session(subject_id: str, summary: str = Form(...)):
+    # append session summary + self-critique
+    p = MEM_ROOT / subject_id / "memory.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = p.read_text() if p.exists() else f"# {subject_id} Memory\n"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    addition = f"\n\n## Session {ts}\n{summary}\n"
+    p.write_text(existing + addition)
+    # also write per-day session file
+    sdir = MEM_ROOT / subject_id / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / f"{datetime.now().strftime('%Y-%m-%d')}.md").write_text(summary)
+    return {"ok": True}
+
+@app.post("/memory/route")
+def route_memory(text: str = Form(...)):
+    # naive router: if contains subject name or "for this subject" -> subject, else global
+    lower = text.lower()
+    is_global = any(k in lower for k in ["always", "all subjects", "every subject", "globally", "in general"])
+    return {"scope": "global" if is_global else "subject", "reason": "keyword heuristic; will be LLM next"}
