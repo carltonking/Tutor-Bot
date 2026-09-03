@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form
-import sqlite3, pathlib, uuid, time, shutil, os, httpx
+import sqlite3, pathlib, uuid, time, shutil, os, httpx, sys
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from rag import extract_text, chunk_text
 
 # --- BYOK: OpenCode Zen (OpenAI-compatible) ---
@@ -318,3 +319,19 @@ def canvas_auth(token: str = Form(...)):
     # append without exposing full token in logs
     with open(env,"a") as f: f.write(f"\nCANVAS_TOKEN={token[:8]}... (stored)\n")
     return {"ok": True, "note": "Canvas token stored (stub) — real OAuth next"}
+
+@app.get("/connectors/canvas/grades")
+def canvas_grades(token: str = ""):
+    # Real impl would call Canvas API /api/v1/courses with Bearer token
+    # For verify: if token provided or stored, return mock grades
+    if not token:
+        # try to read stored token hint from .env
+        try:
+            import pathlib
+            env = pathlib.Path(__file__).parent.parent / ".env"
+            txt = env.read_text() if env.exists() else ""
+            if "CANVAS_TOKEN" not in txt:
+                return {"error":"no token — POST /connectors/canvas/auth first", "mock":[]}
+        except: pass
+    # mock grades
+    return {"grades":[{"course":"Calculus II","assignment":"Midterm 1","score":78,"max":100,"topics":"derivatives,integrals"}, {"course":"Bio 101","assignment":"Quiz 2","score":88,"max":100,"topics":"cells"}],"via":"mock — replace with Canvas /api/v1/courses call when token is real"}

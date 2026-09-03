@@ -14,8 +14,8 @@
       {
         "title": "Study App",
         "width": 1280,
-        "height": 800
-        ,"resizable": true
+        "height": 800,
+        "resizable": true
       }
     ],
     "security": {
@@ -24,8 +24,10 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
-      "endpoints": ["https://github.com/carltonking/study-app/releases/latest/download/latest.json"]
+      "pubkey": "RWTKrYqkpwtcwlbV8cpWZ4vVDsjEmDr7ds7P+wwQ+CpQlKdIIeTsIWUc",
+      "endpoints": [
+        "https://github.com/carltonking/study-app/releases/latest/download/latest.json"
+      ]
     }
   },
   "bundle": {
