@@ -41,22 +41,281 @@ ROOT = pathlib.Path(__file__).parent
 DB = ROOT / "study.db"
 STORE = ROOT / "store"
 STORE.mkdir(exist_ok=True)
+MEM_ROOT = ROOT / "memory"
+MEM_ROOT.mkdir(exist_ok=True)
+GLOBAL_MD = MEM_ROOT / "global.md"
+if not GLOBAL_MD.exists():
+    GLOBAL_MD.write_text("# Global Memory\n\n> Cross-subject preferences. Agent routes general instructions here.\n")
+
+def _migrate_subjects(c):
+    """Add onboarding / timeline columns to subjects (idempotent)."""
+    cols = {r[1] for r in c.execute("PRAGMA table_info(subjects)").fetchall()}
+    for col, decl in [
+        ("objective", "TEXT"),
+        ("mode", "TEXT"),
+        ("school", "TEXT"),
+        ("course_code", "TEXT"),
+        ("start_date", "TEXT"),
+        ("end_date", "TEXT"),
+    ]:
+        if col not in cols:
+            try: c.execute(f"ALTER TABLE subjects ADD COLUMN {col} {decl}")
+            except: pass
 
 def con():
     c = sqlite3.connect(DB)
-    c.execute("CREATE TABLE IF NOT EXISTS subjects(id TEXT PRIMARY KEY, name TEXT, color TEXT, created_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS subjects(id TEXT PRIMARY KEY, name TEXT, color TEXT, created_at TEXT, objective TEXT, mode TEXT, school TEXT, course_code TEXT, start_date TEXT, end_date TEXT)")
+    _migrate_subjects(c)
     c.execute("CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY, subject_id TEXT, filename TEXT, type TEXT, pages INTEGER, chunks INTEGER, path TEXT, created_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY, source_id TEXT, subject_id TEXT, idx INTEGER, text TEXT, embedding TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, subject_id TEXT, role TEXT, text TEXT, created_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS topics(id TEXT PRIMARY KEY, subject_id TEXT, name TEXT, parent_id TEXT, week INTEGER, weight REAL, ord INTEGER)")
+    c.execute("CREATE TABLE IF NOT EXISTS mastery(subject_id TEXT, topic TEXT, score_last2 REAL, mastery_bool INTEGER, updated_at TEXT, PRIMARY KEY(subject_id, topic))")
+    c.execute("CREATE TABLE IF NOT EXISTS assessment_attempts(id TEXT PRIMARY KEY, subject_id TEXT, topic TEXT, score REAL, prompt TEXT, answer TEXT, created_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS plan(id TEXT PRIMARY KEY, subject_id TEXT, week INTEGER, topic TEXT, status TEXT, kind TEXT, start_date TEXT, end_date TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS grades(id TEXT PRIMARY KEY, subject_id TEXT, title TEXT, score REAL, max REAL, topics TEXT, created_at TEXT)")
     # migrate old DB without embedding col
     try:
         c.execute("SELECT embedding FROM chunks LIMIT 1")
     except:
         try: c.execute("ALTER TABLE chunks ADD COLUMN embedding TEXT")
         except: pass
+    # migrate grades created_at
+    gcols = {r[1] for r in c.execute("PRAGMA table_info(grades)").fetchall()}
+    if "created_at" not in gcols:
+        try: c.execute("ALTER TABLE grades ADD COLUMN created_at TEXT")
+        except: pass
+    # migrate plan kind/dates
+    pcols = {r[1] for r in c.execute("PRAGMA table_info(plan)").fetchall()}
+    for col, decl in [("kind", "TEXT"), ("start_date", "TEXT"), ("end_date", "TEXT")]:
+        if col not in pcols:
+            try: c.execute(f"ALTER TABLE plan ADD COLUMN {col} {decl}")
+            except: pass
     return c
 
 con().close()
+
+# --- Mastery / plan helpers ---
+from datetime import datetime, timedelta, date as _date
+
+def _parse_date(s):
+    if not s: return None
+    try: return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except: return None
+
+def _weeks_between(start, end):
+    if not start or not end or end < start:
+        return 1
+    days = (end - start).days + 1
+    return max(1, (days + 6) // 7)
+
+def _default_topics_for(name, objective=""):
+    """Seed topic list when none exist yet — derived from subject, not hard-coded demo weeks."""
+    blob = f"{name} {objective}".lower()
+    seeds = []
+    # light heuristics; otherwise split objective / generic units
+    if any(k in blob for k in ["calc", "derivative", "integral", "limit"]):
+        seeds = ["Limits", "Derivatives", "Applications of Derivatives", "Integrals", "Applications of Integrals", "Series"]
+    elif any(k in blob for k in ["bio", "cell", "genetics"]):
+        seeds = ["Cells", "Genetics", "Evolution", "Ecology", "Physiology"]
+    elif objective:
+        # split objective on commas / semicolons / "and"
+        parts = [p.strip(" .") for p in objective.replace(";", ",").replace(" and ", ",").split(",") if p.strip()]
+        seeds = parts[:8] if parts else []
+    if not seeds:
+        seeds = [f"Unit {i}" for i in range(1, 5)]
+    return seeds
+
+def _ensure_topics(c, subject_id):
+    rows = c.execute("SELECT id, name, ord FROM topics WHERE subject_id=? ORDER BY ord, name", (subject_id,)).fetchall()
+    if rows:
+        return [{"id": r[0], "name": r[1], "ord": r[2]} for r in rows]
+    sub = c.execute("SELECT name, objective FROM subjects WHERE id=?", (subject_id,)).fetchone()
+    name = sub[0] if sub else "Subject"
+    objective = (sub[1] or "") if sub else ""
+    seeds = _default_topics_for(name, objective)
+    out = []
+    for i, t in enumerate(seeds):
+        tid = str(uuid.uuid4())
+        c.execute("INSERT INTO topics VALUES (?,?,?,?,?,?,?)", (tid, subject_id, t, None, None, 1.0, i))
+        out.append({"id": tid, "name": t, "ord": i})
+    return out
+
+def _recompute_mastery_for_topic(c, subject_id, topic):
+    """SPEC: mastery = ≥80% on last 2 assessments AND no recent real-grade failure."""
+    attempts = c.execute(
+        "SELECT score FROM assessment_attempts WHERE subject_id=? AND lower(topic)=lower(?) ORDER BY created_at DESC LIMIT 2",
+        (subject_id, topic),
+    ).fetchall()
+    scores = [float(a[0]) for a in attempts]
+    if len(scores) >= 2:
+        score_last2 = sum(scores) / 2.0
+        assess_ok = all(s >= 80 for s in scores)
+    elif len(scores) == 1:
+        score_last2 = scores[0]
+        assess_ok = False  # need two
+    else:
+        # fall back to real grades average for display
+        grade_rows = c.execute("SELECT score, max, topics FROM grades WHERE subject_id=?", (subject_id,)).fetchall()
+        matched = []
+        for sc, mx, tops in grade_rows:
+            tlist = [x.strip().lower() for x in (tops or "").split(",") if x.strip()]
+            if topic.lower() in tlist and mx:
+                matched.append(100.0 * float(sc) / float(mx))
+        score_last2 = (sum(matched) / len(matched)) if matched else 0.0
+        assess_ok = False
+
+    # recent real-grade failure: any mapped grade <80% in last ~60 days (or any if no timestamp)
+    cutoff = str(time.time() - 60 * 86400)
+    fail = False
+    for sc, mx, tops, created in c.execute(
+        "SELECT score, max, topics, created_at FROM grades WHERE subject_id=?", (subject_id,)
+    ).fetchall():
+        tlist = [x.strip().lower() for x in (tops or "").split(",") if x.strip()]
+        if topic.lower() not in tlist:
+            continue
+        pct = 100.0 * float(sc) / float(mx or 100)
+        if pct < 80:
+            if not created or str(created) >= cutoff or (isinstance(created, str) and created[:4].isdigit() and len(created) >= 10):
+                # treat missing/ISO/epoch as recent enough for MVP
+                fail = True
+                break
+
+    mastery_bool = 1 if (assess_ok and not fail) else 0
+    c.execute(
+        "INSERT INTO mastery(subject_id, topic, score_last2, mastery_bool, updated_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(subject_id, topic) DO UPDATE SET score_last2=excluded.score_last2, mastery_bool=excluded.mastery_bool, updated_at=excluded.updated_at",
+        (subject_id, topic, score_last2, mastery_bool, str(time.time())),
+    )
+    return {"topic": topic, "score_last2": score_last2, "mastery": bool(mastery_bool), "assess_ok": assess_ok, "grade_fail": fail}
+
+def _subject_dates(c, subject_id):
+    row = c.execute("SELECT start_date, end_date, name, objective, mode, school, course_code FROM subjects WHERE id=?", (subject_id,)).fetchone()
+    if not row:
+        return None
+    start = _parse_date(row[0]) or _date.today()
+    end = _parse_date(row[1]) or (start + timedelta(weeks=12))
+    return {"start": start, "end": end, "name": row[2], "objective": row[3] or "", "mode": row[4] or "course",
+            "school": row[5] or "", "course_code": row[6] or ""}
+
+def _generate_plan(c, subject_id, force=False):
+    """Build weekly plan items spanning subject start/end from topics + mastery."""
+    meta = _subject_dates(c, subject_id)
+    if not meta:
+        return []
+    topics = _ensure_topics(c, subject_id)
+    n_weeks = _weeks_between(meta["start"], meta["end"])
+    existing = c.execute("SELECT COUNT(*) FROM plan WHERE subject_id=?", (subject_id,)).fetchone()[0]
+    if existing and not force:
+        rows = c.execute(
+            "SELECT id, week, topic, status, kind, start_date, end_date FROM plan WHERE subject_id=? ORDER BY week, topic",
+            (subject_id,),
+        ).fetchall()
+        return [{"id": r[0], "week": r[1], "topic": r[2], "status": r[3], "kind": r[4] or "learn",
+                 "start_date": r[5], "end_date": r[6]} for r in rows]
+
+    # clear learn/assess items on force regen; keep completed remediation optionally
+    if force:
+        c.execute("DELETE FROM plan WHERE subject_id=?", (subject_id,))
+
+    # order: non-mastered first (re-pace), then by ord
+    mastery_rows = {r[0].lower(): r for r in c.execute(
+        "SELECT topic, score_last2, mastery_bool FROM mastery WHERE subject_id=?", (subject_id,)
+    ).fetchall()}
+    def sort_key(t):
+        m = mastery_rows.get(t["name"].lower())
+        mastered = bool(m[2]) if m else False
+        score = float(m[1]) if m else 0.0
+        return (1 if mastered else 0, score, t["ord"] if t["ord"] is not None else 0)
+
+    ordered = sorted(topics, key=sort_key)
+    # also pull weak grade topics to the front
+    weak = []
+    for sc, mx, tops in c.execute("SELECT score, max, topics FROM grades WHERE subject_id=?", (subject_id,)).fetchall():
+        if mx and float(sc) / float(mx) < 0.8:
+            for t in [x.strip() for x in (tops or "").split(",") if x.strip()]:
+                if t.lower() not in [w.lower() for w in weak]:
+                    weak.append(t)
+    # prepend weak topics if present in topic list
+    name_map = {t["name"].lower(): t for t in ordered}
+    front = []
+    for w in weak:
+        if w.lower() in name_map:
+            front.append(name_map.pop(w.lower()))
+    ordered = front + list(name_map.values())
+
+    items = []
+    today = _date.today()
+    for i, t in enumerate(ordered):
+        week = (i % n_weeks) + 1
+        w_start = meta["start"] + timedelta(weeks=week - 1)
+        w_end = min(meta["start"] + timedelta(weeks=week) - timedelta(days=1), meta["end"])
+        # status relative to today
+        if w_end < today:
+            status = "done"
+        elif w_start <= today <= w_end:
+            status = "active"
+        else:
+            status = "todo"
+        kind = "remediate" if t["name"] in weak or (t["name"].lower() in mastery_rows and not mastery_rows[t["name"].lower()][2] and (mastery_rows[t["name"].lower()][1] or 0) > 0) else "learn"
+        if t["name"] in weak:
+            kind = "remediate"
+        pid = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO plan VALUES (?,?,?,?,?,?,?,?)",
+            (pid, subject_id, week, t["name"], status, kind, w_start.isoformat(), w_end.isoformat()),
+        )
+        items.append({"id": pid, "week": week, "topic": t["name"], "status": status, "kind": kind,
+                      "start_date": w_start.isoformat(), "end_date": w_end.isoformat()})
+
+    # if more weeks than topics, add assess weeks cycling topics
+    if n_weeks > len(ordered) and ordered:
+        for week in range(len(ordered) + 1, n_weeks + 1):
+            t = ordered[(week - 1) % len(ordered)]
+            w_start = meta["start"] + timedelta(weeks=week - 1)
+            w_end = min(meta["start"] + timedelta(weeks=week) - timedelta(days=1), meta["end"])
+            if w_end < today: status = "done"
+            elif w_start <= today <= w_end: status = "active"
+            else: status = "todo"
+            pid = str(uuid.uuid4())
+            c.execute(
+                "INSERT INTO plan VALUES (?,?,?,?,?,?,?,?)",
+                (pid, subject_id, week, t["name"], status, "assess", w_start.isoformat(), w_end.isoformat()),
+            )
+            items.append({"id": pid, "week": week, "topic": t["name"], "status": status, "kind": "assess",
+                          "start_date": w_start.isoformat(), "end_date": w_end.isoformat()})
+    return items
+
+def _repace_plan(c, subject_id, topics_csv):
+    """Emphasize low-grade / weak topics: insert remediation weeks and regenerate order."""
+    topic_list = [x.strip() for x in (topics_csv or "").split(",") if x.strip()]
+    meta = _subject_dates(c, subject_id)
+    if not meta:
+        return {"ok": False, "error": "subject not found"}
+    # ensure topics exist
+    existing = {r[0].lower() for r in c.execute("SELECT name FROM topics WHERE subject_id=?", (subject_id,)).fetchall()}
+    max_ord = c.execute("SELECT MAX(ord) FROM topics WHERE subject_id=?", (subject_id,)).fetchone()[0] or 0
+    for t in topic_list:
+        if t.lower() not in existing:
+            max_ord += 1
+            c.execute("INSERT INTO topics VALUES (?,?,?,?,?,?,?)", (str(uuid.uuid4()), subject_id, t, None, None, 1.0, max_ord))
+        _recompute_mastery_for_topic(c, subject_id, t)
+    # force regenerate so weak topics bubble up
+    items = _generate_plan(c, subject_id, force=True)
+    # also prepend explicit remediation markers at week 1 for each weak topic
+    today = _date.today()
+    for i, t in enumerate(topic_list):
+        pid = str(uuid.uuid4())
+        w_start = meta["start"]
+        w_end = min(meta["start"] + timedelta(days=6), meta["end"])
+        c.execute(
+            "INSERT INTO plan VALUES (?,?,?,?,?,?,?,?)",
+            (pid, subject_id, 1, f"Remediate: {t}", "active" if w_start <= today <= w_end else "todo",
+             "remediate", w_start.isoformat(), w_end.isoformat()),
+        )
+        items.insert(i, {"id": pid, "week": 1, "topic": f"Remediate: {t}", "status": "active",
+                         "kind": "remediate", "start_date": w_start.isoformat(), "end_date": w_end.isoformat()})
+    return {"ok": True, "topics": topic_list, "plan": items}
 
 @app.get("/ping")
 def ping(): return {"pong": True}
@@ -64,18 +323,61 @@ def ping(): return {"pong": True}
 @app.get("/subjects")
 def subjects():
     c = con()
-    rows = c.execute("SELECT id,name,color FROM subjects").fetchall()
+    rows = c.execute("SELECT id,name,color,objective,mode,school,course_code,start_date,end_date FROM subjects").fetchall()
     c.close()
-    return [{"id":r[0],"name":r[1],"color":r[2]} for r in rows]
+    return [{
+        "id": r[0], "name": r[1], "color": r[2],
+        "objective": r[3] or "", "mode": r[4] or "course",
+        "school": r[5] or "", "course_code": r[6] or "",
+        "start_date": r[7] or "", "end_date": r[8] or "",
+    } for r in rows]
 
 @app.post("/subjects")
-def create_subject(name: str = Form(...), color: str = Form("#e14b4b")):
+def create_subject(
+    name: str = Form(...),
+    color: str = Form("#e14b4b"),
+    objective: str = Form(""),
+    mode: str = Form("course"),
+    school: str = Form(""),
+    course_code: str = Form(""),
+    start_date: str = Form(""),
+    end_date: str = Form(""),
+):
     sid = str(uuid.uuid4())
+    if mode not in ("course", "self"):
+        mode = "course"
+    # default timeline: today → +12 weeks if missing
+    if not start_date:
+        start_date = _date.today().isoformat()
+    if not end_date:
+        end_date = (_date.today() + timedelta(weeks=12)).isoformat()
     c = con()
-    c.execute("INSERT INTO subjects VALUES (?,?,?,?)", (sid, name, color, str(int(time.time()))))
+    c.execute(
+        "INSERT INTO subjects(id,name,color,created_at,objective,mode,school,course_code,start_date,end_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (sid, name, color, str(int(time.time())), objective, mode, school, course_code, start_date, end_date),
+    )
+    # seed topics + generate plan spanning dates
+    _ensure_topics(c, sid)
+    plan = _generate_plan(c, sid, force=True)
+    # brief seed in subject memory for the agent
+    mem_dir = MEM_ROOT / sid
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    brief = (
+        f"# {name} Memory\n\n"
+        f"> Mode: {mode} · School: {school or '—'} · Code: {course_code or '—'}\n"
+        f"> Window: {start_date} → {end_date}\n"
+        f"> Objective: {objective or '—'}\n\n"
+        f"## Agent brief\n"
+        f"Tutor this subject toward the objective. Plan has {len(plan)} items across the date range.\n"
+    )
+    (mem_dir / "memory.md").write_text(brief)
     c.commit()
     c.close()
-    return {"id": sid, "name": name, "color": color}
+    return {
+        "id": sid, "name": name, "color": color,
+        "objective": objective, "mode": mode, "school": school, "course_code": course_code,
+        "start_date": start_date, "end_date": end_date, "plan_items": len(plan),
+    }
 
 @app.patch("/subjects/{subject_id}")
 def rename_subject(subject_id: str, name: str = Form(...)):
@@ -88,7 +390,7 @@ def rename_subject(subject_id: str, name: str = Form(...)):
 @app.delete("/subjects/{subject_id}")
 def delete_subject(subject_id: str):
     c = con()
-    for table in ["subjects", "sources", "chunks", "messages", "grades", "plan"]:
+    for table in ["subjects", "sources", "chunks", "messages", "grades", "plan", "topics", "mastery", "assessment_attempts"]:
         try:
             col = "id" if table == "subjects" else "subject_id"
             c.execute(f"DELETE FROM {table} WHERE {col}=?", (subject_id,))
@@ -228,7 +530,14 @@ async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count
     return {"questions": qs, "via":"template"}
 
 @app.post("/assess/grade")
-async def grade(prompt: str = Form(...), answer: str = Form(...), rubric: str = Form(...)):
+async def grade(
+    prompt: str = Form(...),
+    answer: str = Form(...),
+    rubric: str = Form(...),
+    subject_id: str = Form(""),
+    topic: str = Form("general"),
+):
+    result = None
     try:
         if ZEN_KEY:
             messages = [
@@ -240,21 +549,36 @@ async def grade(prompt: str = Form(...), answer: str = Form(...), rubric: str = 
             m = re.search(r"\{.*\}", content, re.S)
             if m:
                 j = json.loads(m.group(0))
-                return {"score": int(j.get("score", 0)), "reasoning": j.get("reasoning", content[:300]), "rubric": rubric, "via":"zen"}
+                result = {"score": int(j.get("score", 0)), "reasoning": j.get("reasoning", content[:300]), "rubric": rubric, "via":"zen"}
     except Exception as e:
         print("zen grade failed", e)
-    score = 70 if len(answer.split()) > 5 else 40
-    if any(w in answer.lower() for w in prompt.lower().split()[:3]): score += 10
-    return {"score": min(score,100), "reasoning": f"Template grader: checked against rubric '{rubric[:40]}...'", "rubric": rubric, "via":"template"}
+    if result is None:
+        score = 70 if len(answer.split()) > 5 else 40
+        if any(w in answer.lower() for w in prompt.lower().split()[:3]): score += 10
+        result = {"score": min(score,100), "reasoning": f"Template grader: checked against rubric '{rubric[:40]}...'", "rubric": rubric, "via":"template"}
+    # writeback → assessment_attempts + mastery
+    mastery = None
+    if subject_id:
+        c = con()
+        # ensure topic
+        exists = c.execute("SELECT 1 FROM topics WHERE subject_id=? AND lower(name)=lower(?)", (subject_id, topic)).fetchone()
+        if not exists and topic:
+            max_ord = c.execute("SELECT MAX(ord) FROM topics WHERE subject_id=?", (subject_id,)).fetchone()[0] or 0
+            c.execute("INSERT INTO topics VALUES (?,?,?,?,?,?,?)", (str(uuid.uuid4()), subject_id, topic, None, None, 1.0, max_ord + 1))
+        aid = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO assessment_attempts VALUES (?,?,?,?,?,?,?)",
+            (aid, subject_id, topic or "general", float(result["score"]), prompt[:500], answer[:1000], str(time.time())),
+        )
+        mastery = _recompute_mastery_for_topic(c, subject_id, topic or "general")
+        c.commit(); c.close()
+        result["attempt_id"] = aid
+        result["mastery"] = mastery
+        result["topic"] = topic or "general"
+    return result
 
 # --- Memory: global.md + per-subject memory.md + sessions ---
 from datetime import datetime
-
-MEM_ROOT = ROOT / "memory"
-MEM_ROOT.mkdir(exist_ok=True)
-GLOBAL_MD = MEM_ROOT / "global.md"
-if not GLOBAL_MD.exists():
-    GLOBAL_MD.write_text("# Global Memory\n\n> Cross-subject preferences. Agent routes general instructions here.\n")
 
 @app.get("/memory/global")
 def get_global():
@@ -301,34 +625,75 @@ def route_memory(text: str = Form(...)):
     is_global = any(k in lower for k in ["always", "all subjects", "every subject", "globally", "in general"])
     return {"scope": "global" if is_global else "subject", "reason": "keyword heuristic; will be LLM next"}
 
-# --- Plan + Grades + Mastery (stub) ---
+# --- Plan + Grades + Mastery (live) ---
 @app.get("/plan/{subject_id}")
 def get_plan(subject_id: str):
     c = con()
-    c.execute("CREATE TABLE IF NOT EXISTS plan(id TEXT PRIMARY KEY, subject_id TEXT, week INTEGER, topic TEXT, status TEXT)")
-    rows = c.execute("SELECT week, topic, status FROM plan WHERE subject_id=? ORDER BY week", (subject_id,)).fetchall()
-    c.close()
-    if not rows:
-        return [{"week":1,"topic":"Limits","status":"done"},{"week":2,"topic":"Derivatives","status":"active"},{"week":3,"topic":"Integrals","status":"todo"}]
-    return [{"week":r[0],"topic":r[1],"status":r[2]} for r in rows]
+    items = _generate_plan(c, subject_id, force=False)
+    c.commit(); c.close()
+    return items
+
+@app.post("/plan/{subject_id}/generate")
+def generate_plan(subject_id: str):
+    c = con()
+    items = _generate_plan(c, subject_id, force=True)
+    c.commit(); c.close()
+    return {"ok": True, "items": items}
+
+@app.get("/topics/{subject_id}")
+def get_topics(subject_id: str):
+    c = con()
+    topics = _ensure_topics(c, subject_id)
+    c.commit(); c.close()
+    return topics
+
+@app.post("/topics/{subject_id}")
+def add_topic(subject_id: str, name: str = Form(...)):
+    c = con()
+    max_ord = c.execute("SELECT MAX(ord) FROM topics WHERE subject_id=?", (subject_id,)).fetchone()[0] or 0
+    tid = str(uuid.uuid4())
+    c.execute("INSERT INTO topics VALUES (?,?,?,?,?,?,?)", (tid, subject_id, name.strip(), None, None, 1.0, max_ord + 1))
+    c.commit(); c.close()
+    return {"id": tid, "name": name.strip()}
+
+@app.get("/mastery/{subject_id}")
+def get_mastery(subject_id: str):
+    c = con()
+    topics = _ensure_topics(c, subject_id)
+    out = []
+    for t in topics:
+        # refresh from attempts/grades
+        m = _recompute_mastery_for_topic(c, subject_id, t["name"])
+        out.append(m)
+    c.commit(); c.close()
+    return out
 
 @app.get("/grades/{subject_id}")
 def get_grades(subject_id: str):
     c = con()
-    c.execute("CREATE TABLE IF NOT EXISTS grades(id TEXT PRIMARY KEY, subject_id TEXT, title TEXT, score REAL, max REAL, topics TEXT)")
-    rows = c.execute("SELECT title, score, max, topics FROM grades WHERE subject_id=?", (subject_id,)).fetchall()
+    rows = c.execute("SELECT title, score, max, topics, created_at FROM grades WHERE subject_id=? ORDER BY created_at DESC", (subject_id,)).fetchall()
     c.close()
-    return [{"title":r[0],"score":r[1],"max":r[2],"topics":r[3]} for r in rows]
+    return [{"title": r[0], "score": r[1], "max": r[2], "topics": r[3] or "", "created_at": r[4]} for r in rows]
 
 @app.post("/grades/{subject_id}")
 def add_grade(subject_id: str, title: str = Form(...), score: float = Form(...), max: float = Form(100), topics: str = Form("")):
     c = con()
-    c.execute("CREATE TABLE IF NOT EXISTS grades(id TEXT PRIMARY KEY, subject_id TEXT, title TEXT, score REAL, max REAL, topics TEXT)")
     gid = str(uuid.uuid4())
-    c.execute("INSERT INTO grades VALUES (?,?,?,?,?,?)", (gid, subject_id, title, score, max, topics))
-    # naive mastery update: if score/max <0.8 mark topic for remediation (stub)
+    c.execute("INSERT INTO grades VALUES (?,?,?,?,?,?,?)", (gid, subject_id, title, score, max, topics, str(time.time())))
+    topic_list = [x.strip() for x in topics.split(",") if x.strip()]
+    mastery_updates = []
+    for t in topic_list:
+        # ensure topic row
+        exists = c.execute("SELECT 1 FROM topics WHERE subject_id=? AND lower(name)=lower(?)", (subject_id, t)).fetchone()
+        if not exists:
+            max_ord = c.execute("SELECT MAX(ord) FROM topics WHERE subject_id=?", (subject_id,)).fetchone()[0] or 0
+            c.execute("INSERT INTO topics VALUES (?,?,?,?,?,?,?)", (str(uuid.uuid4()), subject_id, t, None, None, 1.0, max_ord + 1))
+        mastery_updates.append(_recompute_mastery_for_topic(c, subject_id, t))
+    repaced = None
+    if max and (score / max) < 0.8 and topic_list:
+        repaced = _repace_plan(c, subject_id, topics)
     c.commit(); c.close()
-    return {"id": gid, " mastery_hint": "if <80% will re-inject to plan (next iteration)"}
+    return {"id": gid, "mastery": mastery_updates, "repaced": bool(repaced), "plan": (repaced or {}).get("plan")}
 
 import json as _json
 
@@ -409,15 +774,9 @@ async def chat(subject_id: str = Form(...), message: str = Form(...)):
 @app.post("/plan/repace/{subject_id}")
 def repace(subject_id: str, topics: str = Form(...)):
     c = con()
-    c.execute("CREATE TABLE IF NOT EXISTS plan(id TEXT PRIMARY KEY, subject_id TEXT, week INTEGER, topic TEXT, status TEXT)")
-    # insert remediation week
-    import uuid, time
-    next_week = c.execute("SELECT MAX(week) FROM plan WHERE subject_id=?", (subject_id,)).fetchone()[0] or 3
-    for t in [x.strip() for x in topics.split(",") if x.strip()]:
-        pid = str(uuid.uuid4())
-        c.execute("INSERT INTO plan VALUES (?,?,?,?)", (pid, subject_id, next_week+1, f"Remediate: {t}", "todo"))
+    result = _repace_plan(c, subject_id, topics)
     c.commit(); c.close()
-    return {"ok": True, "topics": topics}
+    return result
 
 # --- Canvas reference connector (stub OAuth) ---
 # --- Connectors: handled via Main Agent chat (ADR 006), no marketplace UI ---
