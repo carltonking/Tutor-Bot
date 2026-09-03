@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { MemoryPanel } from "./MemoryPanel";
 // invoke reserved for future Rust commands
 import "./App.css";
 
@@ -150,7 +151,8 @@ export default function App() {
               <div key={f.id} className="file">{f.filename} <span>{f.type} · {f.pages} pages · {f.chunks} chunks</span></div>
             ))}
             </>)} 
-            {tab!=="Sources" && <div className="panel-title">{tab} (next ticket)</div>}
+            {tab==="Memory" && <MemoryPanel subjectId={selected} subjectName={active.name} />}
+            {tab!=="Sources" && tab!=="Memory" && <div className="panel-title">{tab} (next ticket)</div>}
             <hr />
             <div className="panel-title">Semester Plan</div>
             <div className="week">Week 1 — Limits <span>✓</span></div>
