@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
+// invoke reserved for future Rust commands
 import "./App.css";
 
 type Subject = { id: string; name: string; color: string; time: string; preview: string; initials: string };
@@ -21,11 +23,44 @@ function Droplet({ color, initials }: { color: string; initials: string }) {
   );
 }
 
+type Src = { id:string; filename:string; type:string; pages:number; chunks:number };
+
 export default function App() {
   const [selected, setSelected] = useState<string>("calc");
   const [input, setInput] = useState("");
   const [rightOpen, setRightOpen] = useState(true);
+  const [sources, setSources] = useState<Src[]>([]);
+  const [tab, setTab] = useState<"Sources"|"Plan"|"Mastery"|"Memory">("Sources");
   const active = SUBJECTS.find((s) => s.id === selected) || SUBJECTS[0];
+
+  useEffect(()=>{
+    // fetch sources from python sidecar if running, else mock
+    fetch(`http://localhost:1421/sources/${selected}`).then(r=>r.json()).then(setSources).catch(()=> setSources([
+      {id:"1",filename:"Syllabus.pdf",type:"syllabus",pages:12,chunks:8},
+      {id:"2",filename:"Textbook Ch 1-4.pdf",type:"textbook",pages:42,chunks:842},
+    ]));
+  },[selected]);
+
+  async function upload(type:string) {
+    const p = await open({ multiple:false, filters:[{name:"PDF",extensions:["pdf"]}]});
+    if(!p) return;
+    // try sidecar ingest
+    try {
+      const fd = new FormData();
+      const blob = await fetch(`file://${p}`).then(r=>r.blob()).catch(()=>null);
+      // fallback: Tauri fs read + upload via invoke not yet; show mock
+      if(!blob) throw new Error("no blob");
+      fd.append("file", blob, String(p).split("/").pop()!);
+      fd.append("subject_id", selected);
+      fd.append("file_type", type);
+      const res = await fetch("http://localhost:1421/ingest", {method:"POST", body: fd});
+      const j = await res.json();
+      if(j.id) setSources(s=>[...s,{id:j.id,filename:j.filename,type,pages:j.pages,chunks:j.chunks}]);
+    } catch {
+      // mock add
+      setSources(s=>[...s,{id:String(Date.now()),filename:String(p).split("/").pop()||"file.pdf",type,pages:10,chunks:41}]);
+    }
+  }
 
   return (
     <div className="app">
@@ -98,14 +133,24 @@ export default function App() {
       {rightOpen && (
         <aside className="inspector">
           <div className="tabs">
-            <span className="tab active">Sources</span><span className="tab">Plan</span><span className="tab">Mastery</span><span className="tab">Memory</span>
+            {(["Sources","Plan","Mastery","Memory"] as const).map(t=>(
+              <span key={t} className={`tab ${tab===t?"active":""}`} onClick={()=>setTab(t)}>{t}</span>
+            ))}
           </div>
           <div className="inspector-body">
-            <div className="panel-title">Sources (per subject)</div>
-            <div className="file">Syllabus.pdf <span>12 pages · indexed</span></div>
-            <div className="file">Textbook Ch 1-4.pdf <span>842 chunks</span></div>
-            <div className="file">Teacher Notes — Stokes.pdf <span>style exemplar</span></div>
-            <div className="file">Practice Exam 1.pdf <span>style exemplar</span></div>
+            {tab==="Sources" && (<>
+            <div className="panel-title">Sources (per subject) — per ADR 010/013</div>
+            <div className="upload-row">
+              <button className="u-btn" onClick={()=>upload("syllabus")}>+ Syllabus</button>
+              <button className="u-btn" onClick={()=>upload("textbook")}>+ Textbook</button>
+              <button className="u-btn" onClick={()=>upload("teacher_notes")}>+ Notes</button>
+              <button className="u-btn" onClick={()=>upload("practice_problems")}>+ Problems</button>
+            </div>
+            {sources.map(f=>(
+              <div key={f.id} className="file">{f.filename} <span>{f.type} · {f.pages} pages · {f.chunks} chunks</span></div>
+            ))}
+            </>)} 
+            {tab!=="Sources" && <div className="panel-title">{tab} (next ticket)</div>}
             <hr />
             <div className="panel-title">Semester Plan</div>
             <div className="week">Week 1 — Limits <span>✓</span></div>

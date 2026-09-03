@@ -57,3 +57,6 @@ html,body,#root { height:100%; background:var(--bg); color:var(--white); font-fa
 .week{ background:var(--card); border-radius:10px; padding:10px 12px; font-size:13px; display:flex; justify-content:space-between; } .week.active{ border:1px solid var(--border); }
 .bar{ display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); } .track{ height:8px; background:#1a1a1e; border-radius:999px; overflow:hidden; } .fill{ height:100%; background:var(--white); }
 hr{ border:none; border-top:1px solid var(--border); margin:4px 0; }
+.upload-row{ display:flex; flex-wrap:wrap; gap:6px; }
+.u-btn{ background:var(--card); border:1px solid var(--border); color:var(--white); border-radius:8px; padding:6px 10px; font-size:12px; cursor:pointer; }
+.u-btn:hover{ background:var(--selected); }
