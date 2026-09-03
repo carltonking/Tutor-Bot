@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { MemoryPanel } from "./MemoryPanel";
+import { AssessmentPanel } from "./AssessmentPanel";
+import { GradesPanel } from "./GradesPanel";
 // invoke reserved for future Rust commands
 import "./App.css";
 
@@ -31,7 +33,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [rightOpen, setRightOpen] = useState(true);
   const [sources, setSources] = useState<Src[]>([]);
-  const [tab, setTab] = useState<"Sources"|"Plan"|"Mastery"|"Memory">("Sources");
+  const [tab, setTab] = useState<"Sources"|"Plan"|"Mastery"|"Memory"|"Assessment">("Sources");
   const active = SUBJECTS.find((s) => s.id === selected) || SUBJECTS[0];
   const [chatLog, setChatLog] = useState<Array<{role:"user"|"bot", text:string}>>([]);
 
@@ -112,6 +114,7 @@ export default function App() {
           </div>
 
           <div className="separator"><span>Messages from <span className="pill purple">Main</span> and <span className="pill teal">{active.name}</span></span></div>
+          <div style={{display:"flex", gap:6, marginBottom:8}}><button className="u-btn" onClick={()=> setChatLog(c=>[...c,{role:"bot",text:"[Assessment] Open inspector → Assessment tab"}])}>Study</button><button className="u-btn" onClick={()=> setTab("Memory")}>Memory</button></div>
 
           {chatLog.length===0 ? (
             <>
@@ -135,8 +138,8 @@ export default function App() {
       {rightOpen && (
         <aside className="inspector">
           <div className="tabs">
-            {(["Sources","Plan","Mastery","Memory"] as const).map(t=>(
-              <span key={t} className={`tab ${tab===t?"active":""}`} onClick={()=>setTab(t)}>{t}</span>
+            {(["Sources","Plan","Mastery","Memory","Assessment"] as const).map(t=>(
+              <span key={t} className={`tab ${tab===t?"active":""}`} onClick={()=>setTab(t as any)}>{t}</span>
             ))}
           </div>
           <div className="inspector-body">
@@ -153,7 +156,9 @@ export default function App() {
             ))}
             </>)} 
             {tab==="Memory" && <MemoryPanel subjectId={selected} subjectName={active.name} />}
-            {tab!=="Sources" && tab!=="Memory" && <div className="panel-title">{tab} (next ticket)</div>}
+            {tab==="Assessment" && <AssessmentPanel subjectId={selected} />}
+            {tab==="Plan" && <GradesPanel subjectId={selected} />}
+            {tab!=="Sources" && tab!=="Memory" && tab!=="Assessment" && <div className="panel-title">{tab} (next ticket)</div>}
             <hr />
             <div className="panel-title">Semester Plan</div>
             <div className="week">Week 1 — Limits <span>✓</span></div>
