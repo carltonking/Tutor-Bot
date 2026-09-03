@@ -1,6 +1,30 @@
 from fastapi import FastAPI, UploadFile, File, Form
-import sqlite3, pathlib, uuid, time, shutil, os
+import sqlite3, pathlib, uuid, time, shutil, os, httpx
 from rag import extract_text, chunk_text
+
+# --- BYOK: OpenCode Zen (OpenAI-compatible) ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv(pathlib.Path(__file__).parent.parent / ".env")
+except: pass
+ZEN_KEY = os.getenv("OPENCODE_ZEN_API_KEY", "")
+ZEN_BASE = os.getenv("OPENCODE_ZEN_BASE_URL", "https://api.opencode.ai/v1")
+ZEN_MODEL = os.getenv("OPENCODE_ZEN_MODEL", "zen-1")
+
+async def call_zen(messages, max_tokens=800):
+    if not ZEN_KEY:
+        raise RuntimeError("no key")
+    # Try common Zen endpoints: /chat/completions
+    url = ZEN_BASE.rstrip("/") + "/chat/completions"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers={"Authorization": f"Bearer {ZEN_KEY}", "Content-Type": "application/json"}, json={"model": ZEN_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0.7})
+        r.raise_for_status()
+        j = r.json()
+        # OpenAI shape: choices[0].message.content
+        try:
+            return j["choices"][0]["message"]["content"]
+        except:
+            return str(j)
 
 app = FastAPI()
 ROOT = pathlib.Path(__file__).parent
@@ -71,32 +95,64 @@ def search(subject_id: str, q: str, k: int = 5):
 import random
 
 @app.post("/assess/generate")
-def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count: int = Form(5)):
+async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count: int = Form(5)):
     c = con()
-    rows = c.execute("SELECT text FROM chunks WHERE subject_id=? LIMIT 20", (subject_id,)).fetchall()
+    # Prefer teacher style exemplars
+    rows = c.execute("SELECT text FROM chunks WHERE subject_id=? ORDER BY RANDOM() LIMIT 10", (subject_id,)).fetchall()
+    # also fetch practice_problems as style exemplars
+    style_rows = c.execute("SELECT text FROM chunks WHERE subject_id=? AND source_id IN (SELECT id FROM sources WHERE type=\"practice_problems\") LIMIT 5", (subject_id,)).fetchall()
     c.close()
     if not rows:
         return {"questions": [], "note": "no chunks — upload sources first"}
-    qs = []
+    # Try LLM via Zen
+    try:
+        if ZEN_KEY:
+            ctx = "\n\n".join([r[0][:500] for r in rows[:3]])
+            style = "\n".join([r[0][:300] for r in style_rows]) if style_rows else "No style exemplar — use clear academic style"
+            messages = [
+                {"role":"system","content": "You are a tutor generating assessments. Use the teacher's style exactly. Return JSON array of questions: each with prompt, type (mcq|short_answer), topic, citation, rubric. No markdown."},
+                {"role":"user","content": f"Context chunks:\n{ctx}\n\nTeacher style exemplars:\n{style}\n\nGenerate {count} questions on topic '{topic or 'general'}'. Keep citations."}
+            ]
+            content = await call_zen(messages, max_tokens=1200)
+            import json, re
+            # try to extract JSON array
+            m = re.search(r"\[.*\]", content, re.S)
+            if m:
+                arr = json.loads(m.group(0))
+                qs=[]
+                for item in arr[:count]:
+                    qs.append({"id": str(uuid.uuid4()), "type": item.get("type","mcq"), "prompt": item.get("prompt", str(item))[:400], "topic": item.get("topic", topic or "general"), "citation": item.get("citation", ctx[:60]), "rubric": item.get("rubric","Answer should reference cited chunk")})
+                if qs:
+                    return {"questions": qs, "via":"zen"}
+    except Exception as e:
+        print("zen gen failed", e)
+    # fallback template
+    qs=[]
     for i in range(count):
         chunk = rows[i % len(rows)][0][:180]
         stem = f"Based on: \"{chunk}...\" — what is the key concept?"
-        qs.append({
-            "id": str(uuid.uuid4()),
-            "type": "mcq" if i%2==0 else "short_answer",
-            "prompt": stem,
-            "topic": topic or "general",
-            "citation": chunk[:60],
-            "rubric": "Answer should reference the cited chunk accurately."
-        })
-    return {"questions": qs}
+        qs.append({"id": str(uuid.uuid4()), "type": "mcq" if i%2==0 else "short_answer", "prompt": stem, "topic": topic or "general", "citation": chunk[:60], "rubric": "Answer should reference the cited chunk accurately."})
+    return {"questions": qs, "via":"template"}
 
 @app.post("/assess/grade")
-def grade(prompt: str = Form(...), answer: str = Form(...), rubric: str = Form(...)):
-    # stub grader: keyword overlap
+async def grade(prompt: str = Form(...), answer: str = Form(...), rubric: str = Form(...)):
+    try:
+        if ZEN_KEY:
+            messages = [
+                {"role":"system","content": "You are a strict grader. Score 0-100 based on rubric. Return JSON {score, reasoning}."},
+                {"role":"user","content": f"Prompt: {prompt}\nAnswer: {answer}\nRubric: {rubric}\nReturn JSON only."}
+            ]
+            content = await call_zen(messages, max_tokens=400)
+            import json, re
+            m = re.search(r"\{.*\}", content, re.S)
+            if m:
+                j = json.loads(m.group(0))
+                return {"score": int(j.get("score", 0)), "reasoning": j.get("reasoning", content[:300]), "rubric": rubric, "via":"zen"}
+    except Exception as e:
+        print("zen grade failed", e)
     score = 70 if len(answer.split()) > 5 else 40
     if any(w in answer.lower() for w in prompt.lower().split()[:3]): score += 10
-    return {"score": min(score,100), "reasoning": f"Stub grader: checked against rubric '{rubric[:40]}...'", "rubric": rubric}
+    return {"score": min(score,100), "reasoning": f"Template grader: checked against rubric '{rubric[:40]}...'", "rubric": rubric, "via":"template"}
 
 # --- Memory: global.md + per-subject memory.md + sessions ---
 from datetime import datetime
@@ -180,3 +236,26 @@ def add_grade(subject_id: str, title: str = Form(...), score: float = Form(...),
     # naive mastery update: if score/max <0.8 mark topic for remediation (stub)
     c.commit(); c.close()
     return {"id": gid, " mastery_hint": "if <80% will re-inject to plan (next iteration)"}
+
+@app.post("/chat")
+async def chat(subject_id: str = Form(...), message: str = Form(...)):
+    # RAG + Zen chat with citations
+    c = con()
+    rows = c.execute("SELECT text FROM chunks WHERE subject_id=? ORDER BY RANDOM() LIMIT 3", (subject_id,)).fetchall()
+    c.close()
+    ctx = "\n\n".join([r[0][:600] for r in rows]) if rows else "No sources yet"
+    # also load memory
+    try:
+        mem = (MEM_ROOT / subject_id / "memory.md").read_text()[:500] if (MEM_ROOT / subject_id / "memory.md").exists() else ""
+    except: mem=""
+    try:
+        if ZEN_KEY:
+            messages = [
+                {"role":"system","content": "You are a 1:1 tutor for this subject. Answer grounded in context chunks, cite page/topic. Be concise. Memory: " + mem},
+                {"role":"user","content": f"Context:\n{ctx}\n\nQuestion: {message}"}
+            ]
+            ans = await call_zen(messages, max_tokens=600)
+            return {"answer": ans, "citations": [r[0][:60] for r in rows], "via":"zen"}
+    except Exception as e:
+        print("zen chat failed", e)
+    return {"answer": f"(stub) For {subject_id}: grounded in '{ctx[:120]}...' — here's the explanation.", "citations": [r[0][:60] for r in rows], "via":"template"}
