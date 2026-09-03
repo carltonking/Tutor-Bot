@@ -1,4 +1,4 @@
-# Study App — GrokBot for Studying
+# Tutor Bot — GrokBot for Studying
 
 Open-source desktop tutor (Tauri v2 + Python + SQLite). Main agent spawns persistent per-subject agents. Manual PDFs per subject → RAG (512 chunk + nomic-embed) → assessments style-cloned from teacher notes → grade→topic mastery (80% x2) → plan re-pace. BYOK/Ollama, OS keychain.
 

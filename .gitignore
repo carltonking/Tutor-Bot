@@ -27,3 +27,11 @@ dist-ssr
 python/memory
 python/store
 python/study.db
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Tooling scratch dirs
+.scratch/
+.freebuff/

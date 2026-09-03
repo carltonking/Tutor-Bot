@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form
 import sqlite3, pathlib, uuid, time, shutil, os, httpx, sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from rag import extract_text, chunk_text
+from rag import extract_text, chunk_text, embed_text_smart, cosine
 
 # --- BYOK: OpenCode Zen (OpenAI-compatible) ---
 try:
@@ -28,6 +28,15 @@ async def call_zen(messages, max_tokens=800):
             return str(j)
 
 app = FastAPI()
+
+# CORS: Tauri webview (localhost:1420 / tauri://localhost) calls this sidecar cross-origin
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:1420", "http://127.0.0.1:1420", "tauri://localhost", "http://tauri.localhost"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 ROOT = pathlib.Path(__file__).parent
 DB = ROOT / "study.db"
 STORE = ROOT / "store"
@@ -38,6 +47,7 @@ def con():
     c.execute("CREATE TABLE IF NOT EXISTS subjects(id TEXT PRIMARY KEY, name TEXT, color TEXT, created_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY, subject_id TEXT, filename TEXT, type TEXT, pages INTEGER, chunks INTEGER, path TEXT, created_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY, source_id TEXT, subject_id TEXT, idx INTEGER, text TEXT, embedding TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, subject_id TEXT, role TEXT, text TEXT, created_at TEXT)")
     # migrate old DB without embedding col
     try:
         c.execute("SELECT embedding FROM chunks LIMIT 1")
@@ -57,6 +67,56 @@ def subjects():
     rows = c.execute("SELECT id,name,color FROM subjects").fetchall()
     c.close()
     return [{"id":r[0],"name":r[1],"color":r[2]} for r in rows]
+
+@app.post("/subjects")
+def create_subject(name: str = Form(...), color: str = Form("#e14b4b")):
+    sid = str(uuid.uuid4())
+    c = con()
+    c.execute("INSERT INTO subjects VALUES (?,?,?,?)", (sid, name, color, str(int(time.time()))))
+    c.commit()
+    c.close()
+    return {"id": sid, "name": name, "color": color}
+
+@app.patch("/subjects/{subject_id}")
+def rename_subject(subject_id: str, name: str = Form(...)):
+    c = con()
+    c.execute("UPDATE subjects SET name=? WHERE id=?", (name, subject_id))
+    c.commit()
+    c.close()
+    return {"ok": True, "id": subject_id, "name": name}
+
+@app.delete("/subjects/{subject_id}")
+def delete_subject(subject_id: str):
+    c = con()
+    for table in ["subjects", "sources", "chunks", "messages", "grades", "plan"]:
+        try:
+            col = "id" if table == "subjects" else "subject_id"
+            c.execute(f"DELETE FROM {table} WHERE {col}=?", (subject_id,))
+        except Exception:
+            pass  # table may not exist yet
+    c.commit()
+    c.close()
+    # remove uploaded files + memory for the subject
+    import shutil as _shutil
+    _shutil.rmtree(STORE / subject_id, ignore_errors=True)
+    _shutil.rmtree(MEM_ROOT / subject_id, ignore_errors=True)
+    return {"ok": True, "id": subject_id}
+
+@app.get("/messages/{subject_id}")
+def get_messages(subject_id: str):
+    c = con()
+    rows = c.execute("SELECT role, text FROM messages WHERE subject_id=? ORDER BY created_at", (subject_id,)).fetchall()
+    c.close()
+    return [{"role": r, "text": t} for r, t in rows]
+
+@app.post("/messages/{subject_id}")
+def add_message(subject_id: str, role: str = Form(...), text: str = Form(...)):
+    mid = str(uuid.uuid4())
+    c = con()
+    c.execute("INSERT INTO messages VALUES (?,?,?,?,?)", (mid, subject_id, role, text, str(time.time())))
+    c.commit()
+    c.close()
+    return {"ok": True, "id": mid}
 
 @app.get("/sources/{subject_id}")
 def list_sources(subject_id: str):
@@ -270,17 +330,66 @@ def add_grade(subject_id: str, title: str = Form(...), score: float = Form(...),
     c.commit(); c.close()
     return {"id": gid, " mastery_hint": "if <80% will re-inject to plan (next iteration)"}
 
+import json as _json
+
 @app.post("/chat")
 async def chat(subject_id: str = Form(...), message: str = Form(...)):
-    # RAG + Zen chat with citations
+    # Main-agent connector intent: "connect my grades" / "connect canvas" -> setup flow (ADR 006)
+    lower = message.lower()
+    if subject_id in ("main", "chieff", "orchestrator") and any(k in lower for k in CONNECTOR_KEYWORDS):
+        asked = next((n for n in ["canvas", "blackboard", "brightspace"] if n in lower), None)
+        if not asked:
+            return {
+                "answer": "I can sync your grades. Which LMS — Canvas, Blackboard, or Brightspace? "
+                          "Say e.g. 'connect Canvas' and I'll walk you through it (token or OAuth).",
+                "citations": [], "via": "connector-router",
+            }
+        return {
+            "answer": f"Connecting {asked.title()}. Paste an API access token (Account > Settings > Approved Integrations "
+                      f"in {asked.title()}) and I'll verify it, fetch your courses, and map assignments to topics. "
+                      f"The token goes in your OS keychain — nothing leaves this machine.",
+            "citations": [], "via": "connector-router",
+        }
+    # RAG: semantic retrieval (embed query, cosine vs stored chunk vectors) with keyword fallback
     c = con()
-    rows = c.execute("SELECT text FROM chunks WHERE subject_id=? ORDER BY RANDOM() LIMIT 3", (subject_id,)).fetchall()
+    rows = []
+    try:
+        qemb = embed_text_smart(message)
+        all_rows = c.execute("SELECT text, embedding FROM chunks WHERE subject_id=?", (subject_id,)).fetchall()
+        scored = []
+        for text, emb in all_rows:
+            try:
+                vec = _json.loads(emb) if emb else None
+                if vec:
+                    scored.append((cosine(qemb, vec) + (0.15 if message.lower() in text.lower() else 0), text))
+            except Exception:
+                continue
+        scored.sort(reverse=True, key=lambda x: x[0])
+        rows = [(t,) for _, t in scored[:3]]
+    except Exception as e:
+        print("semantic chat retrieval failed", e)
+    if not rows:
+        rows = c.execute("SELECT text FROM chunks WHERE subject_id=? ORDER BY RANDOM() LIMIT 3", (subject_id,)).fetchall()
     c.close()
     ctx = "\n\n".join([r[0][:600] for r in rows]) if rows else "No sources yet"
     # also load memory
+    mem = ""
     try:
-        mem = (MEM_ROOT / subject_id / "memory.md").read_text()[:500] if (MEM_ROOT / subject_id / "memory.md").exists() else ""
-    except: mem=""
+        p = MEM_ROOT / subject_id / "memory.md"
+        if p.exists():
+            mem = p.read_text()[:500]
+    except Exception:
+        pass
+    def _save(role: str, text: str):
+        try:
+            mc = con()
+            mc.execute("INSERT INTO messages VALUES (?,?,?,?,?)", (str(uuid.uuid4()), subject_id, role, text, str(time.time())))
+            mc.commit()
+            mc.close()
+        except Exception as e:
+            print("msg save failed", e)
+
+    _save("user", message)
     try:
         if ZEN_KEY:
             messages = [
@@ -288,10 +397,13 @@ async def chat(subject_id: str = Form(...), message: str = Form(...)):
                 {"role":"user","content": f"Context:\n{ctx}\n\nQuestion: {message}"}
             ]
             ans = await call_zen(messages, max_tokens=600)
+            _save("bot", ans)
             return {"answer": ans, "citations": [r[0][:60] for r in rows], "via":"zen"}
     except Exception as e:
         print("zen chat failed", e)
-    return {"answer": f"(stub) For {subject_id}: grounded in '{ctx[:120]}...' — here's the explanation.", "citations": [r[0][:60] for r in rows], "via":"template"}
+    answer = f"(stub) For {subject_id}: grounded in '{ctx[:120]}...' — here's the explanation."
+    _save("bot", answer)
+    return {"answer": answer, "citations": [r[0][:60] for r in rows], "via":"template"}
 
 # --- Plan auto re-pace on low grade ---
 @app.post("/plan/repace/{subject_id}")
@@ -308,8 +420,18 @@ def repace(subject_id: str, topics: str = Form(...)):
     return {"ok": True, "topics": topics}
 
 # --- Canvas reference connector (stub OAuth) ---
-@app.get("/connectors")
-def list_connectors(): return [{"id":"canvas","name":"Canvas","status":"added"},{"id":"blackboard","name":"Blackboard","status":"available"}]
+# --- Connectors: handled via Main Agent chat (ADR 006), no marketplace UI ---
+CONNECTOR_KEYWORDS = ["canvas", "blackboard", "brightspace", "grade", "connect", "sync"]
+
+@app.post("/connectors/{connector_id}/add")
+def add_connector(connector_id: str, added: str = Form("true")):
+    # persist enabled/disabled state so the setting survives restarts
+    env = pathlib.Path(__file__).parent.parent / ".env"
+    lines = env.read_text().splitlines() if env.exists() else []
+    lines = [l for l in lines if not l.startswith(f"CONNECTOR_{connector_id.upper()}=")]
+    lines.append(f"CONNECTOR_{connector_id.upper()}={added}")
+    env.write_text("\n".join(lines) + "\n")
+    return {"ok": True, "id": connector_id, "added": added}
 
 @app.post("/connectors/canvas/auth")
 def canvas_auth(token: str = Form(...)):
