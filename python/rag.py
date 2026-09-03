@@ -29,3 +29,22 @@ def chunk_text(text: str, size=CHUNK_SIZE, overlap=OVERLAP):
         if i <= 0:
             break
     return chunks
+
+import hashlib, math
+def embed_text(text: str, dim=384):
+    # deterministic hash-based embedding stub (replaces nomic until Ollama/Zen embeddings land)
+    # stable, no API needed
+    h = hashlib.sha256(text.encode()).digest()
+    # expand to dim via repeated hashing
+    vec = []
+    for i in range(dim):
+        b = h[i % len(h)]
+        vec.append((b / 255.0) * 2 - 1)  # -1..1
+        # mix
+        h = hashlib.sha256(h + i.to_bytes(2,'little')).digest()
+    # normalize
+    n = math.sqrt(sum(x*x for x in vec)) or 1
+    return [x/n for x in vec]
+
+def cosine(a,b):
+    return sum(x*y for x,y in zip(a,b))

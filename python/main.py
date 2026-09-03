@@ -36,7 +36,13 @@ def con():
     c = sqlite3.connect(DB)
     c.execute("CREATE TABLE IF NOT EXISTS subjects(id TEXT PRIMARY KEY, name TEXT, color TEXT, created_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY, subject_id TEXT, filename TEXT, type TEXT, pages INTEGER, chunks INTEGER, path TEXT, created_at TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY, source_id TEXT, subject_id TEXT, idx INTEGER, text TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY, source_id TEXT, subject_id TEXT, idx INTEGER, text TEXT, embedding TEXT)")
+    # migrate old DB without embedding col
+    try:
+        c.execute("SELECT embedding FROM chunks LIMIT 1")
+    except:
+        try: c.execute("ALTER TABLE chunks ADD COLUMN embedding TEXT")
+        except: pass
     return c
 
 con().close()
@@ -76,17 +82,41 @@ async def ingest(subject_id: str = Form(...), file_type: str = Form(...), file: 
     # naive embedding stub: no vector yet, just count
     c = con()
     c.execute("INSERT INTO sources VALUES (?,?,?,?,?,?,?,?)", (sid, subject_id, file.filename, file_type, pages, len(chunks), str(path), str(int(time.time()))))
+    from rag import embed_text
+    import json
     for idx, ch in enumerate(chunks):
         cid = str(uuid.uuid4())
-        c.execute("INSERT INTO chunks VALUES (?,?,?,?,?)", (cid, sid, subject_id, idx, ch))
+        emb = json.dumps(embed_text(ch))
+        c.execute("INSERT INTO chunks VALUES (?,?,?,?,?,?)", (cid, sid, subject_id, idx, ch, emb))
     c.commit()
     c.close()
     return {"id": sid, "filename": file.filename, "pages": pages, "chunks": len(chunks)}
 
 @app.get("/search/{subject_id}")
 def search(subject_id: str, q: str, k: int = 5):
-    # naive keyword search until embeddings land (sqlite-vec next)
     c = con()
+    # try semantic cosine first
+    try:
+        from rag import embed_text, cosine
+        import json
+        qemb = embed_text(q)
+        rows = c.execute("SELECT text, embedding FROM chunks WHERE subject_id=?", (subject_id,)).fetchall()
+        scored=[]
+        for text, emb in rows:
+            try:
+                vec = json.loads(emb) if emb else None
+                if vec:
+                    s = cosine(qemb, vec)
+                    # boost if keyword present
+                    if q.lower() in text.lower(): s += 0.15
+                    scored.append((s, text))
+            except: continue
+        scored.sort(reverse=True, key=lambda x: x[0])
+        if scored:
+            c.close()
+            return [{"text": t, "score": s} for s,t in scored[:k]]
+    except Exception as e:
+        print("semantic search failed", e)
     rows = c.execute("SELECT text FROM chunks WHERE subject_id=? AND text LIKE ? LIMIT ?", (subject_id, f"%{q}%", k)).fetchall()
     c.close()
     return [{"text": r[0]} for r in rows]
@@ -259,3 +289,17 @@ async def chat(subject_id: str = Form(...), message: str = Form(...)):
     except Exception as e:
         print("zen chat failed", e)
     return {"answer": f"(stub) For {subject_id}: grounded in '{ctx[:120]}...' — here's the explanation.", "citations": [r[0][:60] for r in rows], "via":"template"}
+
+# --- Plan auto re-pace on low grade ---
+@app.post("/plan/repace/{subject_id}")
+def repace(subject_id: str, topics: str = Form(...)):
+    c = con()
+    c.execute("CREATE TABLE IF NOT EXISTS plan(id TEXT PRIMARY KEY, subject_id TEXT, week INTEGER, topic TEXT, status TEXT)")
+    # insert remediation week
+    import uuid, time
+    next_week = c.execute("SELECT MAX(week) FROM plan WHERE subject_id=?", (subject_id,)).fetchone()[0] or 3
+    for t in [x.strip() for x in topics.split(",") if x.strip()]:
+        pid = str(uuid.uuid4())
+        c.execute("INSERT INTO plan VALUES (?,?,?,?)", (pid, subject_id, next_week+1, f"Remediate: {t}", "todo"))
+    c.commit(); c.close()
+    return {"ok": True, "topics": topics}
