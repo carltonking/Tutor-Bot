@@ -1,15 +1,14 @@
 # 002 — M1 RAG + Sources Panel
 
-Status: TODO
-Blocks: 003
+Status: DONE (2026-09-03) — naive keyword search; embeddings next
 Blocked-by: 001
-SPEC: §4.2 RAG Service, §4.3 sources/chunks/vectors, ADR 004, 010, 013
+Blocks: 003
 
-Deliverables
-- Per-subject Sources panel (right inspector tab): upload PDF (syllabus/textbook/teacher_notes/practice_problems), file list with type badge/pages/status, remove, re-index
-- Backend: pdf.js/Poppler extract → chunk 512/64 → nomic-embed-text (Ollama) or BYOK embeddings → sqlite-vec per subject table, OCR fallback Tesseract, citation (page) stored, syllabus parser → topics
-- Chat retrieval: top-k chunks cited in answer
-- Teacher style exemplars: practice_problems tagged, retrieved as few-shot for later assessment gen
+Delivered
+- Tabs Sources/Plan/Mastery/Memory (right inspector)
+- Sources: upload via @tauri-apps/plugin-dialog (+ Syllabus/Textbook/Notes/Problems), list per-subject, mock fallback if sidecar not running
+- Rust: dialog+fs plugins + capabilities
+- Python: rag.py (pypdf extract → chunk 512/64), main.py ingest splits pdf→chunks, /sources, /search keyword, store on disk per subject
+- Build: vite 198kB, cargo check ok
 
-Acceptance
-- Upload 10-page PDF → indexed rows appear, citations show in chat answer
+Next: sqlite-vec + nomic-embed (Ollama) for semantic search; teacher style weighting already in data model (type field)

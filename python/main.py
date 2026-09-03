@@ -66,3 +66,34 @@ def search(subject_id: str, q: str, k: int = 5):
     rows = c.execute("SELECT text FROM chunks WHERE subject_id=? AND text LIKE ? LIMIT ?", (subject_id, f"%{q}%", k)).fetchall()
     c.close()
     return [{"text": r[0]} for r in rows]
+
+# --- Minimal assessment generator (template, no LLM yet) ---
+import random
+
+@app.post("/assess/generate")
+def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count: int = Form(5)):
+    c = con()
+    rows = c.execute("SELECT text FROM chunks WHERE subject_id=? LIMIT 20", (subject_id,)).fetchall()
+    c.close()
+    if not rows:
+        return {"questions": [], "note": "no chunks — upload sources first"}
+    qs = []
+    for i in range(count):
+        chunk = rows[i % len(rows)][0][:180]
+        stem = f"Based on: \"{chunk}...\" — what is the key concept?"
+        qs.append({
+            "id": str(uuid.uuid4()),
+            "type": "mcq" if i%2==0 else "short_answer",
+            "prompt": stem,
+            "topic": topic or "general",
+            "citation": chunk[:60],
+            "rubric": "Answer should reference the cited chunk accurately."
+        })
+    return {"questions": qs}
+
+@app.post("/assess/grade")
+def grade(prompt: str = Form(...), answer: str = Form(...), rubric: str = Form(...)):
+    # stub grader: keyword overlap
+    score = 70 if len(answer.split()) > 5 else 40
+    if any(w in answer.lower() for w in prompt.lower().split()[:3]): score += 10
+    return {"score": min(score,100), "reasoning": f"Stub grader: checked against rubric '{rubric[:40]}...'", "rubric": rubric}
