@@ -14,7 +14,16 @@ const SESSION_KEY = "tutorbot.session";
 const QUEUE_KEY = "tutorbot.pending";
 
 type User = { name: string; email: string };
-type Row = { id: string; name: string; color: string };
+type Row = { id: string; name: string; color: string; objective?: string; mode?: string; school?: string; course_code?: string; start_date?: string; end_date?: string };
+type PlanItem = { id?: string; week: number; topic: string; status: string; kind?: string; start_date?: string; end_date?: string };
+type MasteryRow = { topic: string; score_last2: number; mastery: boolean; assess_ok?: boolean; grade_fail?: boolean };
+type NewSubjectForm = { name: string; objective: string; mode: "course" | "self"; school: string; course_code: string; start_date: string; end_date: string };
+const emptyNewSubject = (): NewSubjectForm => {
+  const start = new Date();
+  const end = new Date(start); end.setDate(end.getDate() + 12 * 7);
+  const iso = (d: Date) => d.toISOString().slice(0, 10);
+  return { name: "", objective: "", mode: "course", school: "", course_code: "", start_date: iso(start), end_date: iso(end) };
+};
 type Msg = { role: "user" | "bot" | "system"; text?: string; media?: boolean };
 // Offline queue: mutations made while the sidecar is down, replayed on next load
 type Pending =
@@ -127,7 +136,10 @@ export default function App() {
   const [renameVal, setRenameVal] = useState("");
   const [rowMenuId, setRowMenuId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Row | null>(null);
-  const [newSubject, setNewSubject] = useState<string | null>(null);
+  const [newSubject, setNewSubject] = useState<NewSubjectForm | null>(null);
+  const [plan, setPlan] = useState<PlanItem[]>([]);
+  const [mastery, setMastery] = useState<MasteryRow[]>([]);
+  const [planMeta, setPlanMeta] = useState<{ start_date?: string; end_date?: string }>({});
   const [profileMenu, setProfileMenu] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
@@ -140,7 +152,11 @@ export default function App() {
     if (!user) return;
     fetch(`${SIDECAR}/subjects`).then((r) => r.json()).then(async (j: Array<{ id: string; name: string; color: string }>) => {
       let base: Row[] = Array.isArray(j)
-        ? j.map((s, i) => ({ id: s.id, name: s.name, color: s.color || PALETTE[i % PALETTE.length] }))
+        ? j.map((s: Row, i: number) => ({
+            id: s.id, name: s.name, color: s.color || PALETTE[i % PALETTE.length],
+            objective: s.objective, mode: s.mode, school: s.school, course_code: s.course_code,
+            start_date: s.start_date, end_date: s.end_date,
+          }))
         : [];
       // Replay offline queue against the sidecar
       const q = loadQueue();
@@ -211,6 +227,21 @@ export default function App() {
   useEffect(() => {
     fetch(`${SIDECAR}/sources/${selected === LEAD_ID ? "chieff" : selected}`).then((r) => r.json()).then(setSources).catch(() => setSources([]));
   }, [selected, user]);
+
+  const refreshPlanMastery = useCallback(() => {
+    if (!user || selected === LEAD_ID) {
+      setPlan([]);
+      setMastery([]);
+      setPlanMeta({});
+      return;
+    }
+    const row = rows.find((r) => r.id === selected);
+    setPlanMeta({ start_date: row?.start_date, end_date: row?.end_date });
+    fetch(`${SIDECAR}/plan/${selected}`).then((r) => r.json()).then((j) => setPlan(Array.isArray(j) ? j : [])).catch(() => setPlan([]));
+    fetch(`${SIDECAR}/mastery/${selected}`).then((r) => r.json()).then((j) => setMastery(Array.isArray(j) ? j : [])).catch(() => setMastery([]));
+  }, [selected, user, rows]);
+
+  useEffect(() => { refreshPlanMastery(); }, [refreshPlanMastery]);
 
   useEffect(() => {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight });
@@ -291,17 +322,38 @@ export default function App() {
     }
   }
 
-  async function createSubject(name: string) {
+  async function createSubject(form: NewSubjectForm) {
+    const name = form.name.trim();
+    if (!name) return;
     const color = PALETTE[rows.length % PALETTE.length];
-    const fallbackRow: Row = { id: String(Date.now()), name, color };
+    const fallbackRow: Row = {
+      id: String(Date.now()), name, color,
+      objective: form.objective, mode: form.mode, school: form.school,
+      course_code: form.course_code, start_date: form.start_date, end_date: form.end_date,
+    };
     try {
       const fd = new FormData();
       fd.append("name", name);
       fd.append("color", color);
+      fd.append("objective", form.objective);
+      fd.append("mode", form.mode);
+      fd.append("school", form.school);
+      fd.append("course_code", form.course_code);
+      fd.append("start_date", form.start_date);
+      fd.append("end_date", form.end_date);
       const r = await fetch(`${SIDECAR}/subjects`, { method: "POST", body: fd });
       const j = await r.json();
       if (j.id) {
-        setRows((rs) => [...rs, { id: j.id, name, color }]);
+        const row: Row = {
+          id: j.id, name, color,
+          objective: j.objective ?? form.objective,
+          mode: j.mode ?? form.mode,
+          school: j.school ?? form.school,
+          course_code: j.course_code ?? form.course_code,
+          start_date: j.start_date ?? form.start_date,
+          end_date: j.end_date ?? form.end_date,
+        };
+        setRows((rs) => [...rs, row]);
         setSelected(j.id);
         setNewSubject(null);
         return;
@@ -448,7 +500,7 @@ export default function App() {
           {!filtered.length && loaded && <div className="row-empty">No tutors yet — create one</div>}
         </div>
 
-        <button className="new-subject-btn" onClick={() => setNewSubject("")}>
+        <button className="new-subject-btn" onClick={() => setNewSubject(emptyNewSubject())}>
           <PlusIcon size={15} /> New tutor
         </button>
 
@@ -537,22 +589,45 @@ export default function App() {
             {tab === "Plan" && (
               <>
                 <div className="panel-title">Semester Plan</div>
-                <div className="week">Week 1 — Limits <span>✓</span></div>
-              <div className="week active">Week 2 — Derivatives <span>●</span></div>
-                <div className="week">Week 3 — Integrals <span>○</span></div>
+                {(planMeta.start_date || planMeta.end_date) && (
+                  <div className="file"><span>{planMeta.start_date || "?"} → {planMeta.end_date || "?"}</span></div>
+                )}
+                {plan.length === 0 && selected !== LEAD_ID && (
+                  <div className="file"><span>No plan yet — create a subject with start/end dates.</span></div>
+                )}
+                {plan.map((w, i) => (
+                  <div key={w.id || `${w.week}-${w.topic}-${i}`} className={`week ${w.status === "active" ? "active" : ""}`}>
+                    Week {w.week} — {w.topic}
+                    <span>
+                      {w.kind && w.kind !== "learn" ? `${w.kind} · ` : ""}
+                      {w.status === "done" ? "✓" : w.status === "active" ? "●" : "○"}
+                    </span>
+                  </div>
+                ))}
                 <hr />
-                <GradesPanel subjectId={selected} />
+                <GradesPanel subjectId={selected} onPlanChange={refreshPlanMastery} />
               </>
             )}
             {tab === "Mastery" && (
               <>
                 <div className="panel-title">Mastery</div>
-                <div className="bar"><span>Derivatives</span><div className="track"><div className="fill" style={{ width: "62%" }} /></div></div>
-                <div className="bar"><span>Integrals</span><div className="track"><div className="fill" style={{ width: "41%" }} /></div></div>
+                <div className="file"><span>≥80% on last 2 assessments · no recent real-grade failure</span></div>
+                {mastery.length === 0 && (
+                  <div className="file"><span>No topics yet — add a subject or grade an assessment.</span></div>
+                )}
+                {mastery.map((m) => {
+                  const pct = Math.max(0, Math.min(100, Math.round(m.score_last2 || 0)));
+                  return (
+                    <div key={m.topic} className="bar">
+                      <span>{m.topic}{m.mastery ? " ✓" : ""}{m.grade_fail ? " · grade fail" : ""} — {pct}%</span>
+                      <div className="track"><div className="fill" style={{ width: `${pct}%` }} /></div>
+                    </div>
+                  );
+                })}
               </>
             )}
             {tab === "Memory" && <MemoryPanel subjectId={selected} subjectName={activeName} />}
-            {tab === "Assessment" && <AssessmentPanel subjectId={selected} />}
+            {tab === "Assessment" && <AssessmentPanel subjectId={selected} onMasteryChange={refreshPlanMastery} />}
           </div>
         </aside>
       )}
@@ -560,18 +635,59 @@ export default function App() {
       {/* ===== New subject modal ===== */}
       {newSubject !== null && (
         <div className="overlay" onClick={() => setNewSubject(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
             <h3>New subject tutor</h3>
             <input
               autoFocus
-              placeholder="Subject name (e.g. Calculus II)"
-              value={newSubject}
-              onChange={(e) => setNewSubject(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && newSubject.trim()) createSubject(newSubject.trim()); }}
+              placeholder="Class / subject name (e.g. Calculus II)"
+              value={newSubject.name}
+              onChange={(e) => setNewSubject({ ...newSubject, name: e.target.value })}
             />
+            <input
+              placeholder="Objective (what you want to master)"
+              value={newSubject.objective}
+              onChange={(e) => setNewSubject({ ...newSubject, objective: e.target.value })}
+            />
+            <div className="modal-row">
+              <label className="modal-label">Mode</label>
+              <select
+                className="modal-select"
+                value={newSubject.mode}
+                onChange={(e) => setNewSubject({ ...newSubject, mode: e.target.value as "course" | "self" })}
+              >
+                <option value="course">Course</option>
+                <option value="self">Self-study</option>
+              </select>
+            </div>
+            <input
+              placeholder="School (optional)"
+              value={newSubject.school}
+              onChange={(e) => setNewSubject({ ...newSubject, school: e.target.value })}
+            />
+            <input
+              placeholder="Course code (optional)"
+              value={newSubject.course_code}
+              onChange={(e) => setNewSubject({ ...newSubject, course_code: e.target.value })}
+            />
+            <div className="modal-row">
+              <label className="modal-label">Start</label>
+              <input
+                type="date"
+                value={newSubject.start_date}
+                onChange={(e) => setNewSubject({ ...newSubject, start_date: e.target.value })}
+              />
+            </div>
+            <div className="modal-row">
+              <label className="modal-label">End</label>
+              <input
+                type="date"
+                value={newSubject.end_date}
+                onChange={(e) => setNewSubject({ ...newSubject, end_date: e.target.value })}
+              />
+            </div>
             <div className="modal-actions">
               <button className="btn-ghost" onClick={() => setNewSubject(null)}>Cancel</button>
-              <button className="btn-primary" disabled={!newSubject.trim()} onClick={() => createSubject(newSubject.trim())}>Create</button>
+              <button className="btn-primary" disabled={!newSubject.name.trim()} onClick={() => createSubject(newSubject)}>Create</button>
             </div>
           </div>
         </div>

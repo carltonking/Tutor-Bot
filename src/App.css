@@ -144,6 +144,11 @@ button { font-family: inherit; }
 .menu-item:hover { background: #2a2a30; }
 .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.62); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal { background: #151518; border: 1px solid #2f2f35; border-radius: 18px; padding: 22px; width: 380px; display: flex; flex-direction: column; gap: 12px; }
+.modal-wide { width: 440px; max-height: 90vh; overflow-y: auto; }
+.modal-row { display: flex; align-items: center; gap: 10px; }
+.modal-label { font-size: 12px; color: var(--muted); min-width: 48px; }
+.modal-select { flex: 1; background: #1d1d21; border: 1px solid #2f2f35; border-radius: 10px; padding: 11px 12px; color: var(--white); font-size: 14px; outline: none; }
+.modal input[type=date] { flex: 1; }
 .modal h3 { font-size: 16px; }
 .modal input { background: #1d1d21; border: 1px solid #2f2f35; border-radius: 10px; padding: 11px 12px; color: var(--white); font-size: 14px; outline: none; }
 .settings-note { font-size: 11px; color: var(--muted); line-height: 15px; }
