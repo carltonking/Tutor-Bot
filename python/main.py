@@ -151,3 +151,32 @@ def route_memory(text: str = Form(...)):
     lower = text.lower()
     is_global = any(k in lower for k in ["always", "all subjects", "every subject", "globally", "in general"])
     return {"scope": "global" if is_global else "subject", "reason": "keyword heuristic; will be LLM next"}
+
+# --- Plan + Grades + Mastery (stub) ---
+@app.get("/plan/{subject_id}")
+def get_plan(subject_id: str):
+    c = con()
+    c.execute("CREATE TABLE IF NOT EXISTS plan(id TEXT PRIMARY KEY, subject_id TEXT, week INTEGER, topic TEXT, status TEXT)")
+    rows = c.execute("SELECT week, topic, status FROM plan WHERE subject_id=? ORDER BY week", (subject_id,)).fetchall()
+    c.close()
+    if not rows:
+        return [{"week":1,"topic":"Limits","status":"done"},{"week":2,"topic":"Derivatives","status":"active"},{"week":3,"topic":"Integrals","status":"todo"}]
+    return [{"week":r[0],"topic":r[1],"status":r[2]} for r in rows]
+
+@app.get("/grades/{subject_id}")
+def get_grades(subject_id: str):
+    c = con()
+    c.execute("CREATE TABLE IF NOT EXISTS grades(id TEXT PRIMARY KEY, subject_id TEXT, title TEXT, score REAL, max REAL, topics TEXT)")
+    rows = c.execute("SELECT title, score, max, topics FROM grades WHERE subject_id=?", (subject_id,)).fetchall()
+    c.close()
+    return [{"title":r[0],"score":r[1],"max":r[2],"topics":r[3]} for r in rows]
+
+@app.post("/grades/{subject_id}")
+def add_grade(subject_id: str, title: str = Form(...), score: float = Form(...), max: float = Form(100), topics: str = Form("")):
+    c = con()
+    c.execute("CREATE TABLE IF NOT EXISTS grades(id TEXT PRIMARY KEY, subject_id TEXT, title TEXT, score REAL, max REAL, topics TEXT)")
+    gid = str(uuid.uuid4())
+    c.execute("INSERT INTO grades VALUES (?,?,?,?,?,?)", (gid, subject_id, title, score, max, topics))
+    # naive mastery update: if score/max <0.8 mark topic for remediation (stub)
+    c.commit(); c.close()
+    return {"id": gid, " mastery_hint": "if <80% will re-inject to plan (next iteration)"}
