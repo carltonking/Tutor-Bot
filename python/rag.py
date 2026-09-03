@@ -48,3 +48,22 @@ def embed_text(text: str, dim=384):
 
 def cosine(a,b):
     return sum(x*y for x,y in zip(a,b))
+
+# Try Ollama nomic-embed-text if available, fallback to hash
+def embed_via_ollama(text: str):
+    try:
+        import httpx
+        r = httpx.post("http://localhost:11434/api/embed", json={"model":"nomic-embed-text","input": text}, timeout=5)
+        if r.status_code==200:
+            j=r.json()
+            # Ollama returns {"embeddings": [[...]]}
+            emb = j.get("embeddings", [[]])[0]
+            if emb:
+                import math
+                n = math.sqrt(sum(x*x for x in emb)) or 1
+                return [x/n for x in emb]
+    except: pass
+    return None
+
+def embed_text_smart(text: str):
+    return embed_via_ollama(text) or embed_text(text)

@@ -86,7 +86,8 @@ async def ingest(subject_id: str = Form(...), file_type: str = Form(...), file: 
     import json
     for idx, ch in enumerate(chunks):
         cid = str(uuid.uuid4())
-        emb = json.dumps(embed_text(ch))
+        from rag import embed_text_smart
+        emb = json.dumps(embed_text_smart(ch))
         c.execute("INSERT INTO chunks VALUES (?,?,?,?,?,?)", (cid, sid, subject_id, idx, ch, emb))
     c.commit()
     c.close()
@@ -99,7 +100,8 @@ def search(subject_id: str, q: str, k: int = 5):
     try:
         from rag import embed_text, cosine
         import json
-        qemb = embed_text(q)
+        from rag import embed_text_smart
+        qemb = embed_text_smart(q)
         rows = c.execute("SELECT text, embedding FROM chunks WHERE subject_id=?", (subject_id,)).fetchall()
         scored=[]
         for text, emb in rows:
@@ -303,3 +305,16 @@ def repace(subject_id: str, topics: str = Form(...)):
         c.execute("INSERT INTO plan VALUES (?,?,?,?)", (pid, subject_id, next_week+1, f"Remediate: {t}", "todo"))
     c.commit(); c.close()
     return {"ok": True, "topics": topics}
+
+# --- Canvas reference connector (stub OAuth) ---
+@app.get("/connectors")
+def list_connectors(): return [{"id":"canvas","name":"Canvas","status":"added"},{"id":"blackboard","name":"Blackboard","status":"available"}]
+
+@app.post("/connectors/canvas/auth")
+def canvas_auth(token: str = Form(...)):
+    # store token in keychain stub (env file)
+    import pathlib
+    env = pathlib.Path(__file__).parent.parent / ".env"
+    # append without exposing full token in logs
+    with open(env,"a") as f: f.write(f"\nCANVAS_TOKEN={token[:8]}... (stored)\n")
+    return {"ok": True, "note": "Canvas token stored (stub) — real OAuth next"}
