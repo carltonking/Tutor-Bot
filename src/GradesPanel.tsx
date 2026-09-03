@@ -10,6 +10,10 @@ export function GradesPanel({ subjectId }: { subjectId:string }) {
     const fd = new FormData(); fd.append("title",title); fd.append("score",score); fd.append("max","100"); fd.append("topics",topics);
     try{ await fetch(`http://localhost:1421/grades/${subjectId}`,{method:"POST", body:fd}); }catch{}
     setGrades(g=>[...g,{title, score:parseFloat(score), max:100, topics}]);
+    if(parseFloat(score)/100 < 0.8){
+      const rfd=new FormData(); rfd.append("topics",topics);
+      try{ await fetch(`http://localhost:1421/plan/repace/${subjectId}`,{method:"POST", body: rfd}); }catch{}
+    }
   }
   return (
     <div style={{display:"flex", flexDirection:"column", gap:8}}>
