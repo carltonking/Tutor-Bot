@@ -134,7 +134,8 @@ def rename_subject(subject_id: str, name: str = Form(...)):
 @app.delete("/subjects/{subject_id}")
 def delete_subject(subject_id: str):
     c = con()
-    for table in ["subjects", "sources", "chunks", "messages", "grades", "plan", "mastery"]:
+    for table in ["subjects", "sources", "chunks", "messages", "grades", "plan", "mastery",
+                  "assessments", "assessment_questions", "assessment_attempts"]:
         try:
             col = "id" if table == "subjects" else "subject_id"
             c.execute(f"DELETE FROM {table} WHERE {col}=?", (subject_id,))
@@ -261,13 +262,33 @@ def search(subject_id: str, q: str, k: int = 5):
 # --- Minimal assessment generator (template, no LLM yet) ---
 import random
 
+def _assessment_topic_bias(c, subject_id: str) -> dict:
+    """Weak mastery topics + upcoming (not-done) plan topics for exam weighting.
+    Weak topics are ordered worst-first; plan topics earliest-week-first."""
+    weak = [r[0] for r in c.execute(
+        "SELECT topic FROM mastery WHERE subject_id=? AND mastery_bool=0 ORDER BY score_last ASC LIMIT 5",
+        (subject_id,)).fetchall() if r[0] and r[0] != "general"]
+    upcoming = []
+    for r in c.execute(
+            "SELECT topic FROM plan WHERE subject_id=? AND status!='done' ORDER BY week ASC LIMIT 6",
+            (subject_id,)).fetchall():
+        t = (r[0] or "").replace("Remediate: ", "").strip()
+        if t and t != "general" and t not in upcoming:
+            upcoming.append(t)
+    return {"weak": weak, "upcoming": upcoming}
+
 @app.post("/assess/generate")
-async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count: int = Form(5), kind: str = Form("quiz")):
+async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count: int = Form(0), kind: str = Form("quiz")):
+    if kind not in ("quiz", "practice_exam"):
+        kind = "quiz"
+    if count <= 0:
+        count = 15 if kind == "practice_exam" else 5
     c = con()
     # Prefer teacher style exemplars
     rows = c.execute("SELECT text FROM chunks WHERE subject_id=? ORDER BY RANDOM() LIMIT 10", (subject_id,)).fetchall()
     # also fetch practice_problems as style exemplars
     style_rows = c.execute("SELECT text FROM chunks WHERE subject_id=? AND source_id IN (SELECT id FROM sources WHERE type=\"practice_problems\") LIMIT 5", (subject_id,)).fetchall()
+    bias = _assessment_topic_bias(c, subject_id)
     c.close()
     if not rows:
         return {"questions": [], "note": "no chunks — upload sources first"}
@@ -278,9 +299,14 @@ async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count
         if ZEN_KEY:
             ctx = "\n\n".join([r[0][:500] for r in rows[:3]])
             style = "\n".join([r[0][:300] for r in style_rows]) if style_rows else "No style exemplar — use clear academic style"
+            bias_txt = ""
+            if kind == "practice_exam":
+                bias_txt = (f"\n\nThis is a practice exam. Weight roughly half the questions toward the student's weak topics: "
+                            f"{bias['weak'] or 'none recorded'}. Cover upcoming plan topics: {bias['upcoming'] or 'none scheduled'}. "
+                            f"Tag every question with the specific topic it tests (prefer names from those lists).")
             messages = [
                 {"role":"system","content": "You are a tutor generating assessments. Use the teacher's style exactly. Return JSON array of questions: each with prompt, type (mcq|short_answer), topic, citation, rubric. No markdown."},
-                {"role":"user","content": f"Context chunks:\n{ctx}\n\nTeacher style exemplars:\n{style}\n\nGenerate {count} questions on topic '{topic or 'general'}'. Tag each question with its specific topic. Keep citations."}
+                {"role":"user","content": f"Context chunks:\n{ctx}\n\nTeacher style exemplars:\n{style}\n\nGenerate {count} questions on topic '{topic or 'general'}'. Tag each question with its specific topic.{bias_txt} Keep citations."}
             ]
             content = await call_zen(messages, max_tokens=1200)
             import json, re
@@ -296,23 +322,40 @@ async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count
                     via = "zen"
     except Exception as e:
         print("zen gen failed", e)
-    # fallback template
+    # fallback template — practice exams tag topics from the weak/upcoming bias lists;
+    # quizzes keep the lighter flat tagging (topic param or general)
     if qs is None:
+        pool = []
+        if kind == "practice_exam":
+            pool = (bias["weak"] * 3) + (bias["upcoming"] * 2)
+            if topic:
+                pool = [topic] + pool
         qs=[]
         for i in range(count):
             chunk = rows[i % len(rows)][0][:180]
             stem = f"Based on: \"{chunk}...\" — what is the key concept?"
-            qs.append({"id": str(uuid.uuid4()), "type": "mcq" if i%2==0 else "short_answer", "prompt": stem, "topic": topic or "general", "citation": chunk[:60], "rubric": "Answer should reference the cited chunk accurately."})
+            qtopic = pool[i % len(pool)] if pool else (topic or "general")
+            qs.append({"id": str(uuid.uuid4()), "type": "mcq" if i%2==0 else "short_answer", "prompt": stem, "topic": qtopic, "citation": chunk[:60], "rubric": "Answer should reference the cited chunk accurately."})
     # Persist assessment + questions (kind: quiz | practice_exam)
     aid = str(uuid.uuid4())
     c = con()
-    c.execute("INSERT INTO assessments VALUES (?,?,?,?)", (aid, subject_id, kind if kind in ("quiz", "practice_exam") else "quiz", str(int(time.time()))))
+    c.execute("INSERT INTO assessments VALUES (?,?,?,?)", (aid, subject_id, kind, str(int(time.time()))))
     for i, q in enumerate(qs):
         q["assessment_id"] = aid
         c.execute("INSERT INTO assessment_questions VALUES (?,?,?,?,?,?,?,?)",
                   (q["id"], aid, i, q["prompt"], q["type"], None, q["rubric"], q["topic"]))
     c.commit(); c.close()
-    return {"assessment_id": aid, "questions": qs, "via": via}
+    return {"assessment_id": aid, "questions": qs, "via": via, "kind": kind, "bias": bias}
+
+@app.get("/assess/{subject_id}/recent")
+def recent_assessments(subject_id: str, limit: int = 10):
+    c = con()
+    rows = c.execute(
+        "SELECT a.id, a.kind, a.created_at, (SELECT COUNT(*) FROM assessment_questions q WHERE q.assessment_id=a.id) "
+        "FROM assessments a WHERE a.subject_id=? ORDER BY a.created_at DESC LIMIT ?",
+        (subject_id, limit)).fetchall()
+    c.close()
+    return [{"id": r[0], "kind": r[1], "created_at": r[2], "question_count": r[3]} for r in rows]
 
 @app.post("/assess/grade")
 async def grade(
