@@ -54,6 +54,9 @@ def con():
     c.execute("CREATE TABLE IF NOT EXISTS grades(id TEXT PRIMARY KEY, subject_id TEXT, title TEXT, score REAL, max REAL, topics TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS plan(id TEXT PRIMARY KEY, subject_id TEXT, week INTEGER, topic TEXT, status TEXT, week_of TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS mastery(id TEXT PRIMARY KEY, subject_id TEXT, topic TEXT, score_last REAL, score_prev REAL, mastery_bool INTEGER, updated_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS assessments(id TEXT PRIMARY KEY, subject_id TEXT, kind TEXT, created_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS assessment_questions(id TEXT PRIMARY KEY, assessment_id TEXT, idx INTEGER, prompt TEXT, qtype TEXT, choices_json TEXT, rubric TEXT, topic TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS assessment_attempts(id TEXT PRIMARY KEY, assessment_id TEXT, question_id TEXT, answer TEXT, score REAL, max_score REAL, reasoning TEXT, created_at TEXT)")
     # migrate old DBs: missing embedding col on chunks, missing onboarding cols on subjects, missing week_of on plan
     try:
         c.execute("SELECT embedding FROM chunks LIMIT 1")
@@ -259,7 +262,7 @@ def search(subject_id: str, q: str, k: int = 5):
 import random
 
 @app.post("/assess/generate")
-async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count: int = Form(5)):
+async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count: int = Form(5), kind: str = Form("quiz")):
     c = con()
     # Prefer teacher style exemplars
     rows = c.execute("SELECT text FROM chunks WHERE subject_id=? ORDER BY RANDOM() LIMIT 10", (subject_id,)).fetchall()
@@ -268,6 +271,8 @@ async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count
     c.close()
     if not rows:
         return {"questions": [], "note": "no chunks — upload sources first"}
+    qs = None
+    via = "template"
     # Try LLM via Zen
     try:
         if ZEN_KEY:
@@ -275,7 +280,7 @@ async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count
             style = "\n".join([r[0][:300] for r in style_rows]) if style_rows else "No style exemplar — use clear academic style"
             messages = [
                 {"role":"system","content": "You are a tutor generating assessments. Use the teacher's style exactly. Return JSON array of questions: each with prompt, type (mcq|short_answer), topic, citation, rubric. No markdown."},
-                {"role":"user","content": f"Context chunks:\n{ctx}\n\nTeacher style exemplars:\n{style}\n\nGenerate {count} questions on topic '{topic or 'general'}'. Keep citations."}
+                {"role":"user","content": f"Context chunks:\n{ctx}\n\nTeacher style exemplars:\n{style}\n\nGenerate {count} questions on topic '{topic or 'general'}'. Tag each question with its specific topic. Keep citations."}
             ]
             content = await call_zen(messages, max_tokens=1200)
             import json, re
@@ -283,40 +288,101 @@ async def gen_assess(subject_id: str = Form(...), topic: str = Form(None), count
             m = re.search(r"\[.*\]", content, re.S)
             if m:
                 arr = json.loads(m.group(0))
-                qs=[]
+                built=[]
                 for item in arr[:count]:
-                    qs.append({"id": str(uuid.uuid4()), "type": item.get("type","mcq"), "prompt": item.get("prompt", str(item))[:400], "topic": item.get("topic", topic or "general"), "citation": item.get("citation", ctx[:60]), "rubric": item.get("rubric","Answer should reference cited chunk")})
-                if qs:
-                    return {"questions": qs, "via":"zen"}
+                    built.append({"id": str(uuid.uuid4()), "type": item.get("type","mcq"), "prompt": item.get("prompt", str(item))[:400], "topic": item.get("topic", topic or "general"), "citation": item.get("citation", ctx[:60]), "rubric": item.get("rubric","Answer should reference cited chunk")})
+                if built:
+                    qs = built
+                    via = "zen"
     except Exception as e:
         print("zen gen failed", e)
     # fallback template
-    qs=[]
-    for i in range(count):
-        chunk = rows[i % len(rows)][0][:180]
-        stem = f"Based on: \"{chunk}...\" — what is the key concept?"
-        qs.append({"id": str(uuid.uuid4()), "type": "mcq" if i%2==0 else "short_answer", "prompt": stem, "topic": topic or "general", "citation": chunk[:60], "rubric": "Answer should reference the cited chunk accurately."})
-    return {"questions": qs, "via":"template"}
+    if qs is None:
+        qs=[]
+        for i in range(count):
+            chunk = rows[i % len(rows)][0][:180]
+            stem = f"Based on: \"{chunk}...\" — what is the key concept?"
+            qs.append({"id": str(uuid.uuid4()), "type": "mcq" if i%2==0 else "short_answer", "prompt": stem, "topic": topic or "general", "citation": chunk[:60], "rubric": "Answer should reference the cited chunk accurately."})
+    # Persist assessment + questions (kind: quiz | practice_exam)
+    aid = str(uuid.uuid4())
+    c = con()
+    c.execute("INSERT INTO assessments VALUES (?,?,?,?)", (aid, subject_id, kind if kind in ("quiz", "practice_exam") else "quiz", str(int(time.time()))))
+    for i, q in enumerate(qs):
+        q["assessment_id"] = aid
+        c.execute("INSERT INTO assessment_questions VALUES (?,?,?,?,?,?,?,?)",
+                  (q["id"], aid, i, q["prompt"], q["type"], None, q["rubric"], q["topic"]))
+    c.commit(); c.close()
+    return {"assessment_id": aid, "questions": qs, "via": via}
 
 @app.post("/assess/grade")
-async def grade(prompt: str = Form(...), answer: str = Form(...), rubric: str = Form(...)):
+async def grade(
+    prompt: str = Form(None),
+    answer: str = Form(...),
+    rubric: str = Form(None),
+    assessment_id: str = Form(None),
+    question_id: str = Form(None),
+    subject_id: str = Form(None),
+    topic: str = Form(None),
+    max_score: float = Form(100),
+):
+    rub = rubric or "Answer should reference the cited material accurately."
+    prompt_txt = prompt or "(question not provided)"
+    score = None
+    reasoning = ""
     try:
         if ZEN_KEY:
             messages = [
                 {"role":"system","content": "You are a strict grader. Score 0-100 based on rubric. Return JSON {score, reasoning}."},
-                {"role":"user","content": f"Prompt: {prompt}\nAnswer: {answer}\nRubric: {rubric}\nReturn JSON only."}
+                {"role":"user","content": f"Prompt: {prompt_txt}\nAnswer: {answer}\nRubric: {rub}\nReturn JSON only."}
             ]
             content = await call_zen(messages, max_tokens=400)
             import json, re
             m = re.search(r"\{.*\}", content, re.S)
             if m:
                 j = json.loads(m.group(0))
-                return {"score": int(j.get("score", 0)), "reasoning": j.get("reasoning", content[:300]), "rubric": rubric, "via":"zen"}
+                score = int(j.get("score", 0))
+                reasoning = j.get("reasoning", content[:300])
     except Exception as e:
         print("zen grade failed", e)
-    score = 70 if len(answer.split()) > 5 else 40
-    if any(w in answer.lower() for w in prompt.lower().split()[:3]): score += 10
-    return {"score": min(score,100), "reasoning": f"Template grader: checked against rubric '{rubric[:40]}...'", "rubric": rubric, "via":"template"}
+    if score is None:
+        score = 70 if len(answer.split()) > 5 else 40
+        if any(w in answer.lower() for w in prompt_txt.lower().split()[:3]): score += 10
+        score = min(score, 100)
+        reasoning = f"Template grader: checked against rubric '{rub[:40]}...'"
+        via = "template"
+    else:
+        via = "zen"
+
+    # Persist attempt + feed the shared mastery/re-pace path (same as manual grades)
+    c = con()
+    resolved_topic = None
+    if question_id:
+        qr = c.execute("SELECT topic, assessment_id, prompt, rubric FROM assessment_questions WHERE id=?", (question_id,)).fetchone()
+        if qr:
+            resolved_topic = qr[0]
+            assessment_id = assessment_id or qr[1]
+            prompt = prompt or qr[2]
+            rub = rubric or qr[3] or rub
+    if not subject_id and assessment_id:
+        ar = c.execute("SELECT subject_id FROM assessments WHERE id=?", (assessment_id,)).fetchone()
+        subject_id = ar[0] if ar else None
+    if subject_id and not resolved_topic:
+        # fallback: explicit topic param > subject name
+        if topic:
+            resolved_topic = topic
+        else:
+            sr = c.execute("SELECT name FROM subjects WHERE id=?", (subject_id,)).fetchone()
+            resolved_topic = sr[0] if sr else "general"
+    atid = str(uuid.uuid4())
+    c.execute("INSERT INTO assessment_attempts VALUES (?,?,?,?,?,?,?,?)",
+              (atid, assessment_id, question_id, answer, float(score), float(max_score), reasoning, str(int(time.time()))))
+    re_paced = []
+    if subject_id and resolved_topic:
+        pct = (float(score) / float(max_score)) if max_score else 0.0
+        re_paced = _apply_score_to_mastery(c, subject_id, [resolved_topic], pct)
+    c.commit(); c.close()
+    return {"score": score, "reasoning": reasoning, "rubric": rub, "via": via,
+            "attempt_id": atid, "topic": resolved_topic, "subject_id": subject_id, "re_paced": re_paced}
 
 # --- Memory: global.md + per-subject memory.md + sessions ---
 from datetime import datetime
@@ -448,6 +514,17 @@ def get_grades(subject_id: str):
     c.close()
     return [{"title":r[0],"score":r[1],"max":r[2],"topics":r[3]} for r in rows]
 
+def _apply_score_to_mastery(c, subject_id: str, topics: list, pct: float) -> list:
+    """Shared mastery writeback + re-pace for manual grades and quiz attempts (ADR 015).
+    Returns the topics that triggered remediation."""
+    now = str(int(time.time()))
+    for t in topics:
+        _upsert_mastery(c, subject_id, t, pct, now)
+    if topics and pct < 0.8:
+        _remediate(c, subject_id, topics)
+        return topics
+    return []
+
 @app.post("/grades/{subject_id}")
 def add_grade(subject_id: str, title: str = Form(...), score: float = Form(...), max: float = Form(100), topics: str = Form("")):
     c = con()
@@ -456,14 +533,8 @@ def add_grade(subject_id: str, title: str = Form(...), score: float = Form(...),
     c.execute("INSERT INTO grades VALUES (?,?,?,?,?,?)", (gid, subject_id, title, score, max, topics))
     # Mastery writeback per topic (ADR 015) + server-side re-pace on failure
     pct = (score / max) if max else 0.0
-    now = str(int(time.time()))
     topic_list = [t.strip() for t in topics.split(",") if t.strip()]
-    for t in topic_list:
-        _upsert_mastery(c, subject_id, t, pct, now)
-    re_paced = []
-    if pct < 0.8:
-        _remediate(c, subject_id, topic_list)
-        re_paced = topic_list
+    re_paced = _apply_score_to_mastery(c, subject_id, topic_list, pct)
     c.commit(); c.close()
     return {"id": gid, "pct": pct, "mastery": get_mastery(subject_id), "re_paced": re_paced}
 

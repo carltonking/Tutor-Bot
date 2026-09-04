@@ -6,16 +6,25 @@ CHUNK_SIZE = 512
 OVERLAP = 64
 
 def extract_text(path: str) -> tuple[str, int]:
-    reader = PdfReader(path)
-    pages = len(reader.pages)
-    texts = []
-    for p in reader.pages:
-        try:
-            t = p.extract_text() or ""
-        except Exception:
-            t = ""
-        texts.append(t)
-    return "\n".join(texts), pages
+    """Extract text + page count. Dispatches by extension: PDFs via pypdf,
+    text/markdown/code files read directly (pages=1)."""
+    p = Path(path)
+    if p.suffix.lower() == ".pdf":
+        reader = PdfReader(path)
+        pages = len(reader.pages)
+        texts = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            texts.append(t)
+        return "\n".join(texts), pages
+    # plain text-ish files: .txt .md .markdown .csv and any unknown text extension
+    try:
+        return p.read_text(encoding="utf-8", errors="replace"), 1
+    except Exception as e:
+        raise ValueError(f"Unsupported file type: {p.suffix or '(none)'}") from e
 
 def chunk_text(text: str, size=CHUNK_SIZE, overlap=OVERLAP):
     tokens = re.findall(r"\S+", text)  # naive token = word

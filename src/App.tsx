@@ -612,7 +612,7 @@ export default function App() {
               </>
             )}
             {tab === "Memory" && <MemoryPanel subjectId={selected} subjectName={activeName} />}
-            {tab === "Assessment" && <AssessmentPanel subjectId={selected} />}
+            {tab === "Assessment" && <AssessmentPanel subjectId={selected} onChanged={() => { refreshPlan(selected); refreshMastery(selected); }} />}
           </div>
         </aside>
       )}
