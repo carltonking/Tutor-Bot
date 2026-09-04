@@ -16,6 +16,10 @@ const QUEUE_KEY = "tutorbot.pending";
 type User = { name: string; email: string };
 type Row = { id: string; name: string; color: string };
 type Msg = { role: "user" | "bot" | "system"; text?: string; media?: boolean };
+type PlanItem = { week: number; topic: string; status: string; week_of?: string | null };
+type MasteryRow = { topic: string; score_last: number | null; score_prev: number | null; mastery_bool: boolean; updated_at?: string };
+type Onboarding = { objective: string; mode: "course" | "self"; school: string; course_code: string; start_date: string; end_date: string };
+const EMPTY_ONBOARDING: Onboarding = { objective: "", mode: "self", school: "", course_code: "", start_date: "", end_date: "" };
 // Offline queue: mutations made while the sidecar is down, replayed on next load
 type Pending =
   | { type: "create"; row: Row }
@@ -128,12 +132,42 @@ export default function App() {
   const [rowMenuId, setRowMenuId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Row | null>(null);
   const [newSubject, setNewSubject] = useState<string | null>(null);
+  const [onboarding, setOnboarding] = useState<Onboarding>(EMPTY_ONBOARDING);
   const [profileMenu, setProfileMenu] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
   const [tab, setTab] = useState<"Sources" | "Plan" | "Mastery" | "Memory" | "Assessment">("Sources");
   const [sources, setSources] = useState<Array<{ id: string; filename: string; type: string; pages: number; chunks: number }>>([]);
+  const [plan, setPlan] = useState<PlanItem[]>([]);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [mastery, setMastery] = useState<MasteryRow[]>([]);
   const chatRef = useRef<HTMLDivElement>(null);
+
+  const refreshPlan = useCallback((id: string) => {
+    fetch(`${SIDECAR}/plan/${id}`).then((r) => r.json()).then((j) => setPlan(Array.isArray(j) ? j : [])).catch(() => setPlan([]));
+  }, []);
+  const refreshMastery = useCallback((id: string) => {
+    fetch(`${SIDECAR}/mastery/${id}`).then((r) => r.json()).then((j) => setMastery(Array.isArray(j) ? j : [])).catch(() => setMastery([]));
+  }, []);
+  async function regeneratePlan(id: string) {
+    setPlanLoading(true);
+    try {
+      const fd = new FormData();
+      const row = rows.find((r) => r.id === id);
+      const name = row?.name ?? "";
+      fd.append("objective", name);
+      await fetch(`${SIDECAR}/plan/generate/${id}`, { method: "POST", body: fd });
+    } catch { /* offline — plan tab will show empty */ }
+    refreshPlan(id);
+    setPlanLoading(false);
+  }
+
+  // Load plan + mastery for the selected agent
+  useEffect(() => {
+    if (!user || selected === LEAD_ID) { setPlan([]); setMastery([]); return; }
+    refreshPlan(selected);
+    refreshMastery(selected);
+  }, [user, selected, refreshPlan, refreshMastery]);
 
   // Load agents from DB, then replay any mutations made while offline
   useEffect(() => {
@@ -298,6 +332,14 @@ export default function App() {
       const fd = new FormData();
       fd.append("name", name);
       fd.append("color", color);
+      fd.append("objective", onboarding.objective);
+      fd.append("mode", onboarding.mode);
+      if (onboarding.mode === "course") {
+        fd.append("school", onboarding.school);
+        fd.append("course_code", onboarding.course_code);
+      }
+      fd.append("start_date", onboarding.start_date);
+      fd.append("end_date", onboarding.end_date);
       const r = await fetch(`${SIDECAR}/subjects`, { method: "POST", body: fd });
       const j = await r.json();
       if (j.id) {
@@ -313,6 +355,7 @@ export default function App() {
     setRows((rs) => [...rs, fallbackRow]);
     setSelected(fallbackRow.id);
     setNewSubject(null);
+    setOnboarding(EMPTY_ONBOARDING);
   }
 
   function startRename(id: string) {
@@ -367,7 +410,10 @@ export default function App() {
       fd.append("file_type", type);
       const r = await fetch(`${SIDECAR}/ingest`, { method: "POST", body: fd });
       const j = await r.json();
-      if (j.id) setSources((s) => [...s, { id: j.id, filename: j.filename ?? filename, type, pages: j.pages ?? 0, chunks: j.chunks ?? 0 }]);
+      if (j.id) {
+        setSources((s) => [...s, { id: j.id, filename: j.filename ?? filename, type, pages: j.pages ?? 0, chunks: j.chunks ?? 0 }]);
+        if (selected !== LEAD_ID) { refreshPlan(selected); refreshMastery(selected); }
+      }
     } catch {
       setSources((s) => [...s, { id: String(Date.now()), filename, type, pages: 0, chunks: 0 }]);
     }
@@ -536,19 +582,33 @@ export default function App() {
             )}
             {tab === "Plan" && (
               <>
-                <div className="panel-title">Semester Plan</div>
-                <div className="week">Week 1 — Limits <span>✓</span></div>
-              <div className="week active">Week 2 — Derivatives <span>●</span></div>
-                <div className="week">Week 3 — Integrals <span>○</span></div>
+                <div className="plan-head">
+                  <div className="panel-title">Semester Plan</div>
+                  <button className="u-btn" onClick={() => regeneratePlan(selected)} disabled={planLoading}>{planLoading ? "…" : "Regenerate"}</button>
+                </div>
+                {plan.map((p) => (
+                  <div key={p.week} className={p.status === "active" ? "week active" : "week"}>
+                    <span>Week {p.week}{p.week_of ? ` · ${p.week_of}` : ""}</span>
+                    <span className="week-topic">{p.topic}</span>
+                  </div>
+                ))}
+                {!plan.length && !planLoading && (
+                  <div className="file"><span>No plan yet. Set start/end dates and click Regenerate.</span></div>
+                )}
                 <hr />
-                <GradesPanel subjectId={selected} />
+                <GradesPanel subjectId={selected} onChanged={() => { refreshPlan(selected); refreshMastery(selected); }} />
               </>
             )}
             {tab === "Mastery" && (
               <>
                 <div className="panel-title">Mastery</div>
-                <div className="bar"><span>Derivatives</span><div className="track"><div className="fill" style={{ width: "62%" }} /></div></div>
-                <div className="bar"><span>Integrals</span><div className="track"><div className="fill" style={{ width: "41%" }} /></div></div>
+                {mastery.map((m) => (
+                  <div key={m.topic} className="bar">
+                    <span>{m.topic} {m.mastery_bool ? "· mastered" : m.score_last != null && m.score_last < 0.8 ? "· needs remediation" : ""}</span>
+                    <div className="track"><div className={m.mastery_bool ? "fill" : "fill weak"} style={{ width: `${Math.round((m.score_last ?? 0) * 100)}%` }} /></div>
+                  </div>
+                ))}
+                {!mastery.length && <div className="file"><span>No mastery data yet — log grades or take assessments.</span></div>}
               </>
             )}
             {tab === "Memory" && <MemoryPanel subjectId={selected} subjectName={activeName} />}
@@ -557,18 +617,39 @@ export default function App() {
         </aside>
       )}
 
-      {/* ===== New subject modal ===== */}
+      {/* ===== New subject onboarding modal ===== */}
       {newSubject !== null && (
         <div className="overlay" onClick={() => setNewSubject(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>New subject tutor</h3>
+            <h3>New tutor</h3>
             <input
               autoFocus
               placeholder="Subject name (e.g. Calculus II)"
               value={newSubject}
               onChange={(e) => setNewSubject(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && newSubject.trim()) createSubject(newSubject.trim()); }}
             />
+            <input
+              placeholder="Objective — what do you want to master? (optional)"
+              value={onboarding.objective}
+              onChange={(e) => setOnboarding({ ...onboarding, objective: e.target.value })}
+            />
+            <div className="form-row">
+              <div className="seg">
+                <span className={onboarding.mode === "course" ? "seg-btn active" : "seg-btn"} onClick={() => setOnboarding({ ...onboarding, mode: "course" })}>Course</span>
+                <span className={onboarding.mode === "self" ? "seg-btn active" : "seg-btn"} onClick={() => setOnboarding({ ...onboarding, mode: "self" })}>Self-learning</span>
+              </div>
+            </div>
+            {onboarding.mode === "course" && (
+              <div className="form-row two">
+                <input placeholder="School (optional)" value={onboarding.school} onChange={(e) => setOnboarding({ ...onboarding, school: e.target.value })} />
+                <input placeholder="Course code" value={onboarding.course_code} onChange={(e) => setOnboarding({ ...onboarding, course_code: e.target.value })} />
+              </div>
+            )}
+            <div className="form-row two">
+              <label className="date-field"><span>Start date</span><input type="date" value={onboarding.start_date} onChange={(e) => setOnboarding({ ...onboarding, start_date: e.target.value })} /></label>
+              <label className="date-field"><span>End date</span><input type="date" value={onboarding.end_date} onChange={(e) => setOnboarding({ ...onboarding, end_date: e.target.value })} /></label>
+            </div>
+            <div className="settings-note">With dates set, a week-by-week plan is generated for the whole range.</div>
             <div className="modal-actions">
               <button className="btn-ghost" onClick={() => setNewSubject(null)}>Cancel</button>
               <button className="btn-primary" disabled={!newSubject.trim()} onClick={() => createSubject(newSubject.trim())}>Create</button>
