@@ -34,9 +34,10 @@ app = FastAPI()
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:1420", "http://127.0.0.1:1420", "tauri://localhost", "http://tauri.localhost"],
+    allow_origins=["http://localhost:1420", "http://127.0.0.1:1420", "tauri://localhost", "http://tauri.localhost", "http://127.0.0.1:5173", "http://localhost:5173", "http://host.docker.internal:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_origin_regex=r".*",
 )
 ROOT = pathlib.Path(__file__).parent
 DB = ROOT / "study.db"
@@ -79,6 +80,30 @@ con().close()
 
 @app.get("/ping")
 def ping(): return {"pong": True}
+
+# --- MCP / OpenAPI bridge for Rakazo (skill tools) ---
+@app.get("/openapi.json")
+def openapi():
+    return app.openapi()
+
+@app.get("/mcp")
+def mcp_info():
+    return {"name": "tutorbot-mcp", "version": "0.1.0", "tools": ["ingest","search","assess/generate","assess/grade","grades","mastery","plan","memory"]}
+
+@app.post("/mcp/tools/{name}")
+async def mcp_tool(name: str, payload: dict = None):
+    """Generic JSON entry so Rakazo MCP can call any TutorBot capability."""
+    payload = payload or {}
+    # dispatch by name — wraps existing handlers
+    if name == "retrieve":
+        return search(payload.get("subject_id",""), payload.get("q",""), int(payload.get("k",5)))
+    if name == "get_mastery":
+        return get_mastery(payload.get("subject_id",""))
+    if name == "get_plan":
+        return get_plan(payload.get("subject_id",""))
+    if name == "get_grades":
+        return get_grades(payload.get("subject_id",""))
+    return {"error": f"unknown tool {name}", "hint": "Use legacy REST routes: /search/{id}, /plan/{id}, /mastery/{id}, /assess/generate, /assess/grade, /grades/{id}"}
 
 @app.get("/subjects")
 def subjects():
